@@ -15,6 +15,19 @@ DEFAULT_MEMORY_DIR = Path.home() / ".claude/projects/-Users-d/memory"
 DEFAULT_INDEX_PATH = Path.home() / ".local/share/portfolio-health/index.db"
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
+_SLUG_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
+
+def _derive_slug(path: Path) -> str:
+    """Derive a short bridge-style slug from a memory file path.
+
+    Examples:
+        project_afterimage.md       → "afterimage"
+        project_asc_radar.md        → "asc-radar"
+        project_github_repo_auditor → "github-repo-auditor"
+    """
+    stem = path.stem.removeprefix("project_").lower()
+    return _SLUG_NON_ALNUM.sub("-", stem).strip("-")
 
 
 def parse_memory_file(path: Path) -> dict[str, Any] | None:
@@ -45,9 +58,11 @@ def parse_memory_file(path: Path) -> dict[str, Any] | None:
     name = str(frontmatter.get("name", path.stem.removeprefix("project_")))
     description = str(frontmatter.get("description", ""))
     status = str(frontmatter.get("status", ""))
+    slug = _derive_slug(path)
 
     return {
         "name": name,
+        "slug": slug,
         "file_path": str(path),
         "description": description,
         "status": status,
@@ -62,6 +77,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS projects (
             name TEXT PRIMARY KEY,
+            slug TEXT,
             file_path TEXT NOT NULL,
             description TEXT,
             status TEXT,
@@ -94,6 +110,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             END;
         """
     )
+    # Migrate existing DBs that predate the slug column.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(projects)")}
+    if "slug" not in existing_cols:
+        conn.execute("ALTER TABLE projects ADD COLUMN slug TEXT")
     conn.commit()
 
 
@@ -117,9 +137,10 @@ def _upsert_project(conn: sqlite3.Connection, data: dict[str, Any]) -> None:
     if existing:
         conn.execute(
             """UPDATE projects
-               SET file_path=?, description=?, status=?, mtime=?, frontmatter_json=?, body=?
+               SET slug=?, file_path=?, description=?, status=?, mtime=?, frontmatter_json=?, body=?
                WHERE name=?""",
             (
+                data.get("slug"),
                 data["file_path"],
                 data["description"],
                 data["status"],
@@ -132,10 +153,11 @@ def _upsert_project(conn: sqlite3.Connection, data: dict[str, Any]) -> None:
     else:
         conn.execute(
             """INSERT INTO projects
-               (name, file_path, description, status, mtime, frontmatter_json, body)
-               VALUES (?,?,?,?,?,?,?)""",
+               (name, slug, file_path, description, status, mtime, frontmatter_json, body)
+               VALUES (?,?,?,?,?,?,?,?)""",
             (
                 data["name"],
+                data.get("slug"),
                 data["file_path"],
                 data["description"],
                 data["status"],

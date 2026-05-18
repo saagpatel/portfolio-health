@@ -246,19 +246,26 @@ def stale_candidates(
     now = datetime.now(UTC)
 
     projects = index_conn.execute(
-        "SELECT name, description, status, file_path FROM projects"
+        "SELECT name, slug, description, status, file_path FROM projects"
     ).fetchall()
 
     results = []
     for p in projects:
         name = p["name"]
+        slug = p["slug"] or ""
         status = (p["status"] or "").lower()
         if status in excluded_statuses:
             continue
-        if name in active_names:
+        # Check if active using same multi-key strategy as last_activity lookup.
+        if name in active_names or slug in active_names or name.lower() in active_names:
             continue
 
-        last_ts = last_activity_map.get(name)
+        # Try multiple keys: display name, slug, lowercased name — first hit wins.
+        last_ts = (
+            last_activity_map.get(name)
+            or last_activity_map.get(slug)
+            or last_activity_map.get(name.lower())
+        )
         if last_ts:
             try:
                 # Timestamps may be bare dates ("2026-05-01") or ISO8601 with/without Z

@@ -290,6 +290,170 @@ def test_stale_candidates_no_bridge(index_conn, tmp_path):
     assert "Zeta Archive" not in names
 
 
+def test_stale_candidates_slug_match(tmp_path: Path) -> None:
+    """Slug-based lookup: display name "Foo Project State" matches bridge key "foo"."""
+    from portfolio_health.indexer import open_index
+
+    # Seed the index with a project whose slug is "foo" but display name is "Foo Project State"
+    db_path = tmp_path / "index.db"
+    conn = open_index(db_path)
+    conn.execute(
+        """INSERT INTO projects (name, slug, file_path, description, status, mtime, frontmatter_json, body)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "Foo Project State",
+            "foo",
+            str(tmp_path / "project_foo.md"),
+            "A test project",
+            "active",
+            1_000_000,
+            "{}",
+            "body text",
+        ),
+    )
+    conn.commit()
+
+    # Seed bridge-db with activity keyed by slug "foo", dated 30 days ago
+    bridge_path = tmp_path / "bridge.db"
+    bridge_conn = sqlite3.connect(str(bridge_path))
+    bridge_conn.execute(
+        """CREATE TABLE activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            project_name TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            branch TEXT,
+            tags TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        )"""
+    )
+    thirty_days_ago = (datetime.now(UTC) - timedelta(days=30)).strftime("%Y-%m-%d")
+    bridge_conn.execute(
+        "INSERT INTO activity_log (source, timestamp, project_name, summary, tags)"
+        " VALUES (?, ?, ?, ?, ?)",
+        ("cc", thirty_days_ago, "foo", "did some work", "[]"),
+    )
+    bridge_conn.commit()
+    bridge_conn.close()
+
+    results = stale_candidates(conn, days=90, bridge_path=bridge_path)
+    names = [r["name"] for r in results]
+
+    # The project has activity 30 days ago (within the 90-day window) so it should NOT appear
+    assert "Foo Project State" not in names, (
+        "Slug-matched project still appeared in stale candidates — lookup failed"
+    )
+
+
+def test_stale_candidates_slug_match_days_since(tmp_path: Path) -> None:
+    """When a slug-matched project is stale, days_since reflects actual activity age, not 91."""
+    from portfolio_health.indexer import open_index
+
+    db_path = tmp_path / "index.db"
+    conn = open_index(db_path)
+    conn.execute(
+        """INSERT INTO projects (name, slug, file_path, description, status, mtime, frontmatter_json, body)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "Bar Project State",
+            "bar",
+            str(tmp_path / "project_bar.md"),
+            "Another test project",
+            "active",
+            1_000_000,
+            "{}",
+            "body text",
+        ),
+    )
+    conn.commit()
+
+    # Activity 30 days ago, but stale window is 20 days — project IS stale
+    bridge_path = tmp_path / "bridge.db"
+    bridge_conn = sqlite3.connect(str(bridge_path))
+    bridge_conn.execute(
+        """CREATE TABLE activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            project_name TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            branch TEXT,
+            tags TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        )"""
+    )
+    thirty_days_ago = (datetime.now(UTC) - timedelta(days=30)).strftime("%Y-%m-%d")
+    bridge_conn.execute(
+        "INSERT INTO activity_log (source, timestamp, project_name, summary, tags)"
+        " VALUES (?, ?, ?, ?, ?)",
+        ("cc", thirty_days_ago, "bar", "some work", "[]"),
+    )
+    bridge_conn.commit()
+    bridge_conn.close()
+
+    results = stale_candidates(conn, days=20, bridge_path=bridge_path)
+    match = next((r for r in results if r["name"] == "Bar Project State"), None)
+
+    assert match is not None, "Stale slug-matched project should appear in results"
+    assert match["days_since_last_activity"] != 21, (
+        "days_since should NOT be the fallback 21 (days+1)"
+    )
+    # Activity was ~30 days ago; allow ±1 for day boundary
+    assert 29 <= match["days_since_last_activity"] <= 31, (
+        f"Expected ~30 days since activity, got {match['days_since_last_activity']}"
+    )
+
+
+def test_stale_candidates_no_activity_fallback(tmp_path: Path) -> None:
+    """Project with truly no bridge activity should still return days+1 (91 for 90-day window)."""
+    from portfolio_health.indexer import open_index
+
+    db_path = tmp_path / "index.db"
+    conn = open_index(db_path)
+    conn.execute(
+        """INSERT INTO projects (name, slug, file_path, description, status, mtime, frontmatter_json, body)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "Baz Project State",
+            "baz",
+            str(tmp_path / "project_baz.md"),
+            "No activity project",
+            "active",
+            1_000_000,
+            "{}",
+            "body text",
+        ),
+    )
+    conn.commit()
+
+    # Empty bridge — no activity_log rows at all
+    bridge_path = tmp_path / "bridge.db"
+    bridge_conn = sqlite3.connect(str(bridge_path))
+    bridge_conn.execute(
+        """CREATE TABLE activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            project_name TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            branch TEXT,
+            tags TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        )"""
+    )
+    bridge_conn.commit()
+    bridge_conn.close()
+
+    results = stale_candidates(conn, days=90, bridge_path=bridge_path)
+    match = next((r for r in results if r["name"] == "Baz Project State"), None)
+
+    assert match is not None, "Project with no activity should appear as stale"
+    assert match["days_since_last_activity"] == 91, (
+        f"Expected fallback 91, got {match['days_since_last_activity']}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # portfolio_unshipped
 # ---------------------------------------------------------------------------
