@@ -454,6 +454,59 @@ def test_stale_candidates_no_activity_fallback(tmp_path: Path) -> None:
     )
 
 
+def test_stale_candidates_case_insensitive_match(tmp_path: Path) -> None:
+    """Lowercase index slug should match CamelCase bridge project_name."""
+    from portfolio_health.indexer import open_index
+
+    db_path = tmp_path / "index.db"
+    conn = open_index(db_path)
+    conn.execute(
+        """INSERT INTO projects (name, slug, file_path, description, status, mtime, frontmatter_json, body)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "Wavelength Project",
+            "wavelength",
+            str(tmp_path / "project_wavelength.md"),
+            "Test of case-mismatch handling",
+            "active",
+            1_000_000,
+            "{}",
+            "body text",
+        ),
+    )
+    conn.commit()
+
+    bridge_path = tmp_path / "bridge.db"
+    bridge_conn = sqlite3.connect(str(bridge_path))
+    bridge_conn.execute(
+        """CREATE TABLE activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            project_name TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            branch TEXT,
+            tags TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        )"""
+    )
+    thirty_days_ago = (datetime.now(UTC) - timedelta(days=30)).strftime("%Y-%m-%d")
+    # Bridge logs under CamelCase "Wavelength" — slug is lowercase "wavelength"
+    bridge_conn.execute(
+        "INSERT INTO activity_log (source, timestamp, project_name, summary, tags)"
+        " VALUES (?, ?, ?, ?, ?)",
+        ("cc", thirty_days_ago, "Wavelength", "did work", "[]"),
+    )
+    bridge_conn.commit()
+    bridge_conn.close()
+
+    results = stale_candidates(conn, days=90, bridge_path=bridge_path)
+    names = [r["name"] for r in results]
+    assert "Wavelength Project" not in names, (
+        "Case-mismatch between slug and bridge project_name should not block active detection"
+    )
+
+
 # ---------------------------------------------------------------------------
 # portfolio_unshipped
 # ---------------------------------------------------------------------------

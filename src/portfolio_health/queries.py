@@ -219,7 +219,9 @@ def stale_candidates(
     cutoff = _days_ago_iso(days)
     bridge = _open_bridge(bridge_path)
 
-    # Names that have had activity recently
+    # Names that have had activity recently. Store both literal and lowercase
+    # variants so a lowercase index slug can match a CamelCase bridge project_name
+    # (e.g., bridge "Wavelength" against index slug "wavelength").
     active_names: set[str] = set()
     if bridge:
         try:
@@ -227,16 +229,22 @@ def stale_candidates(
                 "SELECT DISTINCT project_name FROM activity_log WHERE timestamp >= ?",
                 (cutoff,),
             ).fetchall()
-            active_names = {r["project_name"] for r in rows}
+            for r in rows:
+                pn = r["project_name"]
+                active_names.add(pn)
+                active_names.add(pn.lower())
 
             # Get last activity date per project (for days_since calc)
             sql_last = (
                 "SELECT project_name, MAX(timestamp) AS last_ts"
                 " FROM activity_log GROUP BY project_name"
             )
-            last_activity_map: dict[str, str] = {
-                r["project_name"]: r["last_ts"] for r in bridge.execute(sql_last).fetchall()
-            }
+            last_activity_map: dict[str, str] = {}
+            for r in bridge.execute(sql_last).fetchall():
+                pn = r["project_name"]
+                ts = r["last_ts"]
+                last_activity_map[pn] = ts
+                last_activity_map.setdefault(pn.lower(), ts)
         finally:
             bridge.close()
     else:
