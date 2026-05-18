@@ -1,0 +1,225 @@
+"""Build and incrementally refresh the FTS5 SQLite index from project_*.md memory files."""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+# Default paths (overridable for tests)
+DEFAULT_MEMORY_DIR = Path.home() / ".claude/projects/-Users-d/memory"
+DEFAULT_INDEX_PATH = Path.home() / ".local/share/portfolio-health/index.db"
+
+_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
+
+
+def parse_memory_file(path: Path) -> dict[str, Any] | None:
+    """Parse a project_*.md file into structured data. Returns None on parse error."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    frontmatter: dict[str, Any] = {}
+    body = text
+
+    m = _FRONTMATTER_RE.match(text)
+    if m:
+        try:
+            raw = yaml.safe_load(m.group(1))
+            if isinstance(raw, dict):
+                frontmatter = raw
+        except yaml.YAMLError:
+            pass
+        body = text[m.end() :]
+
+    # Flatten nested dicts (some files use metadata: {type:, node_type:})
+    if "metadata" in frontmatter and isinstance(frontmatter["metadata"], dict):
+        for k, v in frontmatter["metadata"].items():
+            frontmatter.setdefault(k, v)
+
+    name = str(frontmatter.get("name", path.stem.removeprefix("project_")))
+    description = str(frontmatter.get("description", ""))
+    status = str(frontmatter.get("status", ""))
+
+    return {
+        "name": name,
+        "file_path": str(path),
+        "description": description,
+        "status": status,
+        "mtime": int(path.stat().st_mtime),
+        "frontmatter_json": json.dumps(frontmatter),
+        "body": body.strip(),
+    }
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS projects (
+            name TEXT PRIMARY KEY,
+            file_path TEXT NOT NULL,
+            description TEXT,
+            status TEXT,
+            mtime INTEGER NOT NULL,
+            frontmatter_json TEXT NOT NULL,
+            body TEXT NOT NULL
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS projects_fts
+            USING fts5(name, description, body, content='projects', content_rowid='rowid');
+
+        CREATE TRIGGER IF NOT EXISTS projects_ai
+            AFTER INSERT ON projects BEGIN
+                INSERT INTO projects_fts(rowid, name, description, body)
+                VALUES (new.rowid, new.name, new.description, new.body);
+            END;
+
+        CREATE TRIGGER IF NOT EXISTS projects_au
+            AFTER UPDATE ON projects BEGIN
+                INSERT INTO projects_fts(projects_fts, rowid, name, description, body)
+                VALUES ('delete', old.rowid, old.name, old.description, old.body);
+                INSERT INTO projects_fts(rowid, name, description, body)
+                VALUES (new.rowid, new.name, new.description, new.body);
+            END;
+
+        CREATE TRIGGER IF NOT EXISTS projects_ad
+            AFTER DELETE ON projects BEGIN
+                INSERT INTO projects_fts(projects_fts, rowid, name, description, body)
+                VALUES ('delete', old.rowid, old.name, old.description, old.body);
+            END;
+        """
+    )
+    conn.commit()
+
+
+def open_index(index_path: Path = DEFAULT_INDEX_PATH) -> sqlite3.Connection:
+    """Open (creating if needed) the index database. Schema is guaranteed."""
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(index_path))
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    return conn
+
+
+def _index_max_mtime(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT COALESCE(MAX(mtime), 0) FROM projects").fetchone()
+    return int(row[0])
+
+
+def _upsert_project(conn: sqlite3.Connection, data: dict[str, Any]) -> None:
+    """Insert or update a single project record (triggers keep FTS in sync)."""
+    existing = conn.execute("SELECT name FROM projects WHERE name = ?", (data["name"],)).fetchone()
+    if existing:
+        conn.execute(
+            """UPDATE projects
+               SET file_path=?, description=?, status=?, mtime=?, frontmatter_json=?, body=?
+               WHERE name=?""",
+            (
+                data["file_path"],
+                data["description"],
+                data["status"],
+                data["mtime"],
+                data["frontmatter_json"],
+                data["body"],
+                data["name"],
+            ),
+        )
+    else:
+        conn.execute(
+            """INSERT INTO projects
+               (name, file_path, description, status, mtime, frontmatter_json, body)
+               VALUES (?,?,?,?,?,?,?)""",
+            (
+                data["name"],
+                data["file_path"],
+                data["description"],
+                data["status"],
+                data["mtime"],
+                data["frontmatter_json"],
+                data["body"],
+            ),
+        )
+
+
+def refresh_index(
+    conn: sqlite3.Connection,
+    memory_dir: Path = DEFAULT_MEMORY_DIR,
+) -> int:
+    """Incrementally refresh index for any project_*.md files newer than current max mtime.
+
+    Returns the number of files indexed/updated.
+    """
+    current_max = _index_max_mtime(conn)
+    updated = 0
+
+    files = sorted(memory_dir.glob("project_*.md"))
+    for path in files:
+        try:
+            file_mtime = int(path.stat().st_mtime)
+        except OSError:
+            continue
+
+        if file_mtime <= current_max:
+            # Check if this specific file is already in the index at this mtime
+            row = conn.execute(
+                "SELECT mtime FROM projects WHERE file_path = ?", (str(path),)
+            ).fetchone()
+            if row and int(row["mtime"]) >= file_mtime:
+                continue
+
+        data = parse_memory_file(path)
+        if data is None:
+            continue
+
+        _upsert_project(conn, data)
+        updated += 1
+
+    if updated:
+        conn.commit()
+
+    return updated
+
+
+def build_full_index(
+    conn: sqlite3.Connection,
+    memory_dir: Path = DEFAULT_MEMORY_DIR,
+) -> int:
+    """Index ALL project_*.md files regardless of mtime (used in tests / force-rebuild)."""
+    indexed = 0
+    for path in sorted(memory_dir.glob("project_*.md")):
+        data = parse_memory_file(path)
+        if data is None:
+            continue
+        _upsert_project(conn, data)
+        indexed += 1
+    if indexed:
+        conn.commit()
+    return indexed
+
+
+def maybe_refresh(
+    conn: sqlite3.Connection,
+    memory_dir: Path = DEFAULT_MEMORY_DIR,
+) -> None:
+    """Called at the start of every MCP tool call — cheap stat-based refresh."""
+    # If any file is newer than our max mtime, do the incremental pass
+    current_max = _index_max_mtime(conn)
+    needs_refresh = False
+    try:
+        for path in memory_dir.glob("project_*.md"):
+            try:
+                if int(path.stat().st_mtime) > current_max:
+                    needs_refresh = True
+                    break
+            except OSError:
+                continue
+    except OSError:
+        return
+
+    if needs_refresh:
+        refresh_index(conn, memory_dir)
