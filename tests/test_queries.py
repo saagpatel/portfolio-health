@@ -298,8 +298,9 @@ def test_stale_candidates_slug_match(tmp_path: Path) -> None:
     db_path = tmp_path / "index.db"
     conn = open_index(db_path)
     conn.execute(
-        """INSERT INTO projects (name, slug, file_path, description, status, mtime, frontmatter_json, body)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        "INSERT INTO projects "
+        "(name, slug, file_path, description, status, mtime, frontmatter_json, body) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             "Foo Project State",
             "foo",
@@ -353,8 +354,9 @@ def test_stale_candidates_slug_match_days_since(tmp_path: Path) -> None:
     db_path = tmp_path / "index.db"
     conn = open_index(db_path)
     conn.execute(
-        """INSERT INTO projects (name, slug, file_path, description, status, mtime, frontmatter_json, body)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        "INSERT INTO projects "
+        "(name, slug, file_path, description, status, mtime, frontmatter_json, body) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             "Bar Project State",
             "bar",
@@ -412,8 +414,9 @@ def test_stale_candidates_no_activity_fallback(tmp_path: Path) -> None:
     db_path = tmp_path / "index.db"
     conn = open_index(db_path)
     conn.execute(
-        """INSERT INTO projects (name, slug, file_path, description, status, mtime, frontmatter_json, body)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        "INSERT INTO projects "
+        "(name, slug, file_path, description, status, mtime, frontmatter_json, body) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             "Baz Project State",
             "baz",
@@ -461,8 +464,9 @@ def test_stale_candidates_case_insensitive_match(tmp_path: Path) -> None:
     db_path = tmp_path / "index.db"
     conn = open_index(db_path)
     conn.execute(
-        """INSERT INTO projects (name, slug, file_path, description, status, mtime, frontmatter_json, body)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        "INSERT INTO projects "
+        "(name, slug, file_path, description, status, mtime, frontmatter_json, body) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             "Wavelength Project",
             "wavelength",
