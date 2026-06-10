@@ -51,10 +51,10 @@ Portfolio truth currently marks this project as `recent` with `boilerplate` cont
 
 ## Known Risks
 
-- This repo only has minimum-viable recovery context today; deeper handoff details may still live in the README and supporting docs.
+- The portfolio context is minimum-viable; verify current state from the README and source files before expanding scope.
 
 ## Next Recommended Move
 
-Use this context plus the README and supporting docs to resume the next active task, then promote the repo beyond minimum-viable by capturing a dedicated handoff, roadmap, or discovery artifact.
+If work continues here, capture a small repo-specific handoff or roadmap only after verifying current live files.
 
 <!-- portfolio-context:end -->
