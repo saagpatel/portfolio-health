@@ -39,7 +39,10 @@ portfolio-health is an active local project in the /Users/d/Projects portfolio.
 
 ## Current State
 
-Portfolio truth currently marks this project as `recent` with `boilerplate` context. Phase 104 recovered minimum-viable context so future sessions can resume without rediscovery.
+Portfolio truth generated on 2026-06-19 marks this project as `active-infra`
+with minimum-viable context. PR #3 fixed disposable-cache reconciliation and
+bridge activity noise handling. Keep this repo as a read-oriented MCP helper,
+not a replacement source of portfolio truth.
 
 ## Stack
 
@@ -47,14 +50,24 @@ Portfolio truth currently marks this project as `recent` with `boilerplate` cont
 
 ## How To Run
 
-- Review the README and top-level scripts before the next session; this repo does not yet expose one canonical run command inside the new context block.
+- MCP server: `uv run python -m portfolio_health`
+- Health report: `uv run portfolio-health health`
+- Live-safe source smoke: use `portfolio-health health --index-path <temp-db> --full-rebuild`
+  so the default live cache is not mutated.
 
 ## Known Risks
 
-- The portfolio context is minimum-viable; verify current state from the README and source files before expanding scope.
+- The local SQLite index is disposable cache; bridge-db, memory files, and
+  generated portfolio truth remain upstream evidence sources.
+- This repo overlaps with GithubRepoAuditor and portfolio-intelligence only as
+  a query/signal helper. Do not let it become a second portfolio truth generator.
+- MCP registration is documented but should not be changed casually from this
+  repo.
 
 ## Next Recommended Move
 
-If work continues here, capture a small repo-specific handoff or roadmap only after verifying current live files.
+Before audits or integrations, run the health report against a temp index and
+confirm memory-file count, cache rows, duplicate paths/slugs, and latest
+bridge-db activity timestamp.
 
 <!-- portfolio-context:end -->
