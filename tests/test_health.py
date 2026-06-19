@@ -56,8 +56,10 @@ def test_collect_health_full_rebuild_reports_aligned_cache(tmp_path: Path):
     assert report["index"]["stale_cached_paths"] == 0
     assert report["index"]["missing_cached_files"] == 0
     assert report["index"]["duplicate_file_paths"] == []
+    assert report["bridge"]["schema_present"] is True
     assert report["bridge"]["activity_row_count"] == 1
     assert report["bridge"]["latest_activity_timestamp"] == "2026-06-19T05:11:26Z"
+    assert report["checks"]["bridge_activity_log_present"] is True
 
 
 def test_collect_health_readonly_reports_cache_drift(tmp_path: Path):

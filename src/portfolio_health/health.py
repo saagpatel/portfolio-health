@@ -104,6 +104,7 @@ def _read_bridge_health(bridge_path: Path) -> dict[str, Any]:
         return {
             "path": str(bridge_path),
             "exists": False,
+            "schema_present": False,
             "activity_row_count": 0,
             "latest_activity_timestamp": None,
         }
@@ -113,6 +114,7 @@ def _read_bridge_health(bridge_path: Path) -> dict[str, Any]:
             return {
                 "path": str(bridge_path),
                 "exists": True,
+                "schema_present": False,
                 "activity_row_count": 0,
                 "latest_activity_timestamp": None,
             }
@@ -122,6 +124,7 @@ def _read_bridge_health(bridge_path: Path) -> dict[str, Any]:
         return {
             "path": str(bridge_path),
             "exists": True,
+            "schema_present": True,
             "activity_row_count": int(row["count"]),
             "latest_activity_timestamp": row["latest"],
         }
@@ -180,6 +183,7 @@ def collect_health(
             finally:
                 conn.close()
 
+    bridge_health = _read_bridge_health(bridge_path)
     checks = {
         "cache_matches_memory_files": (
             memory_exists
@@ -190,6 +194,7 @@ def collect_health(
         "fts_matches_projects": index_health["fts_row_count"] == index_health["project_row_count"],
         "no_duplicate_file_paths": not index_health["duplicate_file_paths"],
         "no_duplicate_slugs": not index_health["duplicate_slugs"],
+        "bridge_activity_log_present": bridge_health["exists"] and bridge_health["schema_present"],
     }
     status = "ok" if all(checks.values()) and memory_exists else "warn"
 
@@ -207,7 +212,7 @@ def collect_health(
             "refreshed_rows": refreshed_rows,
             **index_health,
         },
-        "bridge": _read_bridge_health(bridge_path),
+        "bridge": bridge_health,
         "checks": checks,
     }
 
