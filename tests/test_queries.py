@@ -127,6 +127,32 @@ def test_list_active_alpha_count(index_conn, bridge_db):
     assert alpha["activity_count"] == 2
 
 
+def test_list_active_ignores_session_boundary_rows(index_conn, bridge_db):
+    conn = sqlite3.connect(str(bridge_db))
+    recent = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rows = [
+        ("cc", recent, "Operant", "CC session ended", None, '["session-boundary"]'),
+        ("cc", recent, "Alpha Project", "CC session ended", None, '["session-boundary"]'),
+    ]
+    conn.executemany(
+        "INSERT INTO activity_log"
+        " (source, timestamp, project_name, summary, branch, tags)"
+        " VALUES (?,?,?,?,?,?)",
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+    results = list_active(index_conn, window_days=14, bridge_path=bridge_db)
+    names = [r["name"] for r in results]
+    alpha = next((r for r in results if r["name"] == "Alpha Project"), None)
+
+    assert "Operant" not in names
+    assert alpha is not None
+    assert alpha["activity_count"] == 2
+    assert alpha["last_activity_summary"] != "CC session ended"
+
+
 # ---------------------------------------------------------------------------
 # portfolio_get_project
 # ---------------------------------------------------------------------------
@@ -511,6 +537,59 @@ def test_stale_candidates_case_insensitive_match(tmp_path: Path) -> None:
     )
 
 
+def test_stale_candidates_ignores_session_boundary_activity(tmp_path: Path) -> None:
+    """Session-boundary-only activity should not make a project look active."""
+    from portfolio_health.indexer import open_index
+
+    db_path = tmp_path / "index.db"
+    conn = open_index(db_path)
+    conn.execute(
+        "INSERT INTO projects "
+        "(name, slug, file_path, description, status, mtime, frontmatter_json, body) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "Boundary Only",
+            "boundary-only",
+            str(tmp_path / "project_boundary_only.md"),
+            "Only has session boundary activity",
+            "active",
+            1_000_000,
+            "{}",
+            "body text",
+        ),
+    )
+    conn.commit()
+
+    bridge_path = tmp_path / "bridge.db"
+    bridge_conn = sqlite3.connect(str(bridge_path))
+    bridge_conn.execute(
+        """CREATE TABLE activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            project_name TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            branch TEXT,
+            tags TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        )"""
+    )
+    recent = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+    bridge_conn.execute(
+        "INSERT INTO activity_log (source, timestamp, project_name, summary, tags)"
+        " VALUES (?, ?, ?, ?, ?)",
+        ("cc", recent, "Boundary Only", "CC session ended", '["session-boundary"]'),
+    )
+    bridge_conn.commit()
+    bridge_conn.close()
+
+    results = stale_candidates(conn, days=90, bridge_path=bridge_path)
+    match = next((r for r in results if r["name"] == "Boundary Only"), None)
+
+    assert match is not None
+    assert match["days_since_last_activity"] == 91
+
+
 # ---------------------------------------------------------------------------
 # portfolio_unshipped
 # ---------------------------------------------------------------------------
@@ -553,6 +632,24 @@ def test_unshipped_excludes_no_pattern(index_conn, bridge_db):
     results = unshipped(index_conn, bridge_path=bridge_db)
     names = [r["name"] for r in results]
     assert "Gamma CLI" not in names
+
+
+def test_unshipped_does_not_treat_partial_tag_as_shipped(index_conn, bridge_db):
+    conn = sqlite3.connect(str(bridge_db))
+    recent = (datetime.now(UTC) - timedelta(days=3)).strftime("%Y-%m-%d")
+    conn.execute(
+        "INSERT INTO activity_log (source, timestamp, project_name, summary, tags)"
+        " VALUES (?, ?, ?, ?, ?)",
+        ("cc", recent, "Beta Dashboard", "Not actually shipped", '["NOT_SHIPPED"]'),
+    )
+    conn.commit()
+    conn.close()
+
+    results = unshipped(index_conn, bridge_path=bridge_db)
+    beta = next((r for r in results if r["name"] == "Beta Dashboard"), None)
+
+    assert beta is not None
+    assert beta["days_since_last_shipped"] is None
 
 
 def test_unshipped_no_bridge(index_conn, tmp_path):

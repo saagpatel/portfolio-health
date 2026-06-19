@@ -131,8 +131,59 @@ def _index_max_mtime(conn: sqlite3.Connection) -> int:
     return int(row[0])
 
 
+def _prune_missing_files(conn: sqlite3.Connection, file_paths: set[str]) -> int:
+    """Remove cache rows whose backing memory file is no longer present."""
+    if not file_paths:
+        cursor = conn.execute("DELETE FROM projects")
+        return cursor.rowcount
+
+    placeholders = ",".join("?" for _ in file_paths)
+    cursor = conn.execute(
+        f"DELETE FROM projects WHERE file_path NOT IN ({placeholders})",
+        tuple(sorted(file_paths)),
+    )
+    return cursor.rowcount
+
+
 def _upsert_project(conn: sqlite3.Connection, data: dict[str, Any]) -> None:
-    """Insert or update a single project record (triggers keep FTS in sync)."""
+    """Insert or update a single project record (triggers keep FTS in sync).
+
+    The memory file path is the stable cache identity. The frontmatter name can
+    change over time, so same-path rows with old names are stale cache residue.
+    """
+    path_rows = conn.execute(
+        "SELECT name FROM projects WHERE file_path = ? ORDER BY name",
+        (data["file_path"],),
+    ).fetchall()
+    if path_rows:
+        existing_name = data["name"]
+        row_names = {row["name"] for row in path_rows}
+        if existing_name not in row_names:
+            existing_name = path_rows[0]["name"]
+
+        for row_name in row_names:
+            if row_name != existing_name:
+                conn.execute("DELETE FROM projects WHERE name = ?", (row_name,))
+
+        conn.execute(
+            """UPDATE projects
+               SET name=?, slug=?, file_path=?, description=?, status=?,
+                   mtime=?, frontmatter_json=?, body=?
+               WHERE name=?""",
+            (
+                data["name"],
+                data.get("slug"),
+                data["file_path"],
+                data["description"],
+                data["status"],
+                data["mtime"],
+                data["frontmatter_json"],
+                data["body"],
+                existing_name,
+            ),
+        )
+        return
+
     existing = conn.execute("SELECT name FROM projects WHERE name = ?", (data["name"],)).fetchone()
     if existing:
         conn.execute(
@@ -172,26 +223,36 @@ def refresh_index(
     conn: sqlite3.Connection,
     memory_dir: Path = DEFAULT_MEMORY_DIR,
 ) -> int:
-    """Incrementally refresh index for any project_*.md files newer than current max mtime.
+    """Incrementally refresh index for changed files and prune stale cache rows.
 
-    Returns the number of files indexed/updated.
+    Returns the number of files indexed/updated plus stale rows pruned.
     """
+    if not memory_dir.exists():
+        return 0
+
     current_max = _index_max_mtime(conn)
     updated = 0
 
     files = sorted(memory_dir.glob("project_*.md"))
+    current_paths = {str(path) for path in files}
+    updated += _prune_missing_files(conn, current_paths)
+
     for path in files:
         try:
             file_mtime = int(path.stat().st_mtime)
         except OSError:
             continue
 
+        rows = conn.execute(
+            "SELECT name, mtime FROM projects WHERE file_path = ?",
+            (str(path),),
+        ).fetchall()
         if file_mtime <= current_max:
-            # Check if this specific file is already in the index at this mtime
-            row = conn.execute(
-                "SELECT mtime FROM projects WHERE file_path = ?", (str(path),)
-            ).fetchone()
-            if row and int(row["mtime"]) >= file_mtime:
+            # Check if this specific file is already in the index at this mtime.
+            # If duplicate rows exist for the same file path, parse once and let
+            # _upsert_project collapse the stale display-name rows.
+            current_row = next((row for row in rows if int(row["mtime"]) >= file_mtime), None)
+            if len(rows) == 1 and current_row:
                 continue
 
         data = parse_memory_file(path)
@@ -212,14 +273,20 @@ def build_full_index(
     memory_dir: Path = DEFAULT_MEMORY_DIR,
 ) -> int:
     """Index ALL project_*.md files regardless of mtime (used in tests / force-rebuild)."""
+    if not memory_dir.exists():
+        return 0
+
     indexed = 0
-    for path in sorted(memory_dir.glob("project_*.md")):
+    files = sorted(memory_dir.glob("project_*.md"))
+    pruned = _prune_missing_files(conn, {str(path) for path in files})
+
+    for path in files:
         data = parse_memory_file(path)
         if data is None:
             continue
         _upsert_project(conn, data)
         indexed += 1
-    if indexed:
+    if indexed or pruned:
         conn.commit()
     return indexed
 
@@ -229,11 +296,15 @@ def maybe_refresh(
     memory_dir: Path = DEFAULT_MEMORY_DIR,
 ) -> None:
     """Called at the start of every MCP tool call — cheap stat-based refresh."""
-    # If any file is newer than our max mtime, do the incremental pass
+    # If any file is newer or the cached path set drifted, do the incremental pass.
     current_max = _index_max_mtime(conn)
     needs_refresh = False
     try:
-        for path in memory_dir.glob("project_*.md"):
+        if not memory_dir.exists():
+            return
+        files = sorted(memory_dir.glob("project_*.md"))
+        current_paths = {str(path) for path in files}
+        for path in files:
             try:
                 if int(path.stat().st_mtime) > current_max:
                     needs_refresh = True
@@ -242,6 +313,11 @@ def maybe_refresh(
                 continue
     except OSError:
         return
+
+    if not needs_refresh:
+        cached_paths = [row["file_path"] for row in conn.execute("SELECT file_path FROM projects")]
+        if set(cached_paths) != current_paths or len(cached_paths) != len(current_paths):
+            needs_refresh = True
 
     if needs_refresh:
         refresh_index(conn, memory_dir)

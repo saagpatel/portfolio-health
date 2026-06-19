@@ -34,6 +34,24 @@ def _open_bridge(bridge_path: Path) -> sqlite3.Connection | None:
     return conn
 
 
+def _parse_tags(raw_tags: str | None) -> list[str]:
+    try:
+        tags = json.loads(raw_tags or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(tags, list):
+        return []
+    return [tag for tag in tags if isinstance(tag, str)]
+
+
+def _has_tag(raw_tags: str | None, tag: str) -> bool:
+    return tag in _parse_tags(raw_tags)
+
+
+def _is_session_boundary(raw_tags: str | None) -> bool:
+    return _has_tag(raw_tags, "session-boundary")
+
+
 def _sanitize_fts_query(query: str) -> str:
     """Strip FTS5 special operators to prevent syntax errors, then add prefix wildcards.
 
@@ -73,31 +91,39 @@ def list_active(
     try:
         rows = bridge.execute(
             """
-            SELECT
-                project_name,
-                MAX(timestamp) AS last_ts,
-                (SELECT summary FROM activity_log a2
-                 WHERE a2.project_name = a.project_name
-                 ORDER BY a2.timestamp DESC LIMIT 1) AS last_summary,
-                COUNT(*) AS activity_count
-            FROM activity_log a
+            SELECT project_name, timestamp, summary, tags
+            FROM activity_log
             WHERE timestamp >= ?
-            GROUP BY project_name
-            ORDER BY last_ts DESC
+            ORDER BY timestamp DESC
             """,
             (cutoff,),
         ).fetchall()
     finally:
         bridge.close()
 
+    activity_by_project: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if _is_session_boundary(row["tags"]):
+            continue
+        project = row["project_name"]
+        current = activity_by_project.setdefault(
+            project,
+            {
+                "name": project,
+                "last_activity_ts": row["timestamp"],
+                "last_activity_summary": row["summary"],
+                "activity_count": 0,
+            },
+        )
+        current["activity_count"] += 1
+
     return [
-        {
-            "name": r["project_name"],
-            "last_activity_ts": r["last_ts"],
-            "last_activity_summary": r["last_summary"],
-            "activity_count": r["activity_count"],
-        }
-        for r in rows
+        item
+        for item in sorted(
+            activity_by_project.values(),
+            key=lambda x: x["last_activity_ts"],
+            reverse=True,
+        )
     ]
 
 
@@ -226,24 +252,28 @@ def stale_candidates(
     if bridge:
         try:
             rows = bridge.execute(
-                "SELECT DISTINCT project_name FROM activity_log WHERE timestamp >= ?",
+                "SELECT project_name, tags FROM activity_log WHERE timestamp >= ?",
                 (cutoff,),
             ).fetchall()
             for r in rows:
+                if _is_session_boundary(r["tags"]):
+                    continue
                 pn = r["project_name"]
                 active_names.add(pn)
                 active_names.add(pn.lower())
 
             # Get last activity date per project (for days_since calc)
             sql_last = (
-                "SELECT project_name, MAX(timestamp) AS last_ts"
-                " FROM activity_log GROUP BY project_name"
+                "SELECT project_name, timestamp, tags"
+                " FROM activity_log ORDER BY timestamp DESC"
             )
             last_activity_map: dict[str, str] = {}
             for r in bridge.execute(sql_last).fetchall():
+                if _is_session_boundary(r["tags"]):
+                    continue
                 pn = r["project_name"]
-                ts = r["last_ts"]
-                last_activity_map[pn] = ts
+                ts = r["timestamp"]
+                last_activity_map.setdefault(pn, ts)
                 last_activity_map.setdefault(pn.lower(), ts)
         finally:
             bridge.close()
@@ -329,11 +359,7 @@ def unshipped(
                 (cutoff_30,),
             ).fetchall()
             for r in rows:
-                try:
-                    tags = json.loads(r["tags"] or "[]")
-                except (json.JSONDecodeError, TypeError):
-                    tags = []
-                if "SHIPPED" in tags:
+                if _has_tag(r["tags"], "SHIPPED"):
                     recently_shipped.add(r["project_name"])
         finally:
             bridge.close()
@@ -345,14 +371,12 @@ def unshipped(
     bridge2 = _open_bridge(bridge_path)
     if bridge2:
         try:
-            sql_shipped = (
-                "SELECT project_name, MAX(timestamp) AS last_ts"
-                " FROM activity_log WHERE tags LIKE '%SHIPPED%'"
-                " GROUP BY project_name"
-            )
-            shipped_dates = {
-                r["project_name"]: r["last_ts"] for r in bridge2.execute(sql_shipped).fetchall()
-            }
+            rows = bridge2.execute(
+                "SELECT project_name, timestamp, tags FROM activity_log ORDER BY timestamp DESC"
+            ).fetchall()
+            for r in rows:
+                if _has_tag(r["tags"], "SHIPPED"):
+                    shipped_dates.setdefault(r["project_name"], r["timestamp"])
         finally:
             bridge2.close()
 

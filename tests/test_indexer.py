@@ -144,6 +144,136 @@ def test_refresh_index_new_file(mem_conn: sqlite3.Connection, tmp_path: Path):
     assert row is not None
 
 
+def test_refresh_index_renamed_frontmatter_updates_existing_row(tmp_path: Path):
+    """Changing a file's frontmatter name should not leave an old-name row behind."""
+    import os
+    import shutil
+    import time
+
+    fake_mem = tmp_path / "memory"
+    shutil.copytree(FIXTURE_MEMORY, fake_mem)
+    conn = open_index(tmp_path / "index.db")
+    build_full_index(conn, fake_mem)
+
+    alpha_path = fake_mem / "project_alpha.md"
+    alpha_path.write_text(
+        "---\n"
+        "name: Alpha Renamed\n"
+        "description: iOS app for tracking daily habits - launch-ready\n"
+        "type: project\n"
+        "status: active\n"
+        "---\n\n"
+        "## Overview\n\n"
+        "Alpha is still the same project file.\n"
+    )
+    os.utime(alpha_path, (time.time() + 10, time.time() + 10))
+
+    updated = refresh_index(conn, fake_mem)
+
+    assert updated >= 1
+    assert conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 8
+    assert conn.execute("SELECT name FROM projects WHERE name = 'Alpha Project'").fetchone() is None
+    renamed = conn.execute("SELECT name FROM projects WHERE name = 'Alpha Renamed'").fetchone()
+    assert renamed is not None
+    path_count = conn.execute(
+        "SELECT COUNT(*) FROM projects WHERE file_path = ?",
+        (str(alpha_path),),
+    ).fetchone()[0]
+    assert path_count == 1
+
+
+def test_refresh_index_collapses_duplicate_rows_for_same_file_path(tmp_path: Path):
+    """Existing duplicate rows for one file path should collapse to the parsed current name."""
+    import shutil
+
+    fake_mem = tmp_path / "memory"
+    shutil.copytree(FIXTURE_MEMORY, fake_mem)
+    conn = open_index(tmp_path / "index.db")
+    build_full_index(conn, fake_mem)
+
+    alpha_path = fake_mem / "project_alpha.md"
+    alpha = conn.execute("SELECT * FROM projects WHERE name = 'Alpha Project'").fetchone()
+    conn.execute(
+        """INSERT INTO projects
+           (name, slug, file_path, description, status, mtime, frontmatter_json, body)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (
+            "Old Alpha Name",
+            alpha["slug"],
+            alpha["file_path"],
+            alpha["description"],
+            alpha["status"],
+            alpha["mtime"],
+            alpha["frontmatter_json"],
+            alpha["body"],
+        ),
+    )
+    conn.commit()
+
+    updated = refresh_index(conn, fake_mem)
+
+    assert updated >= 1
+    assert conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 8
+    old_alpha = conn.execute("SELECT name FROM projects WHERE name = 'Old Alpha Name'").fetchone()
+    assert old_alpha is None
+    path_count = conn.execute(
+        "SELECT COUNT(*) FROM projects WHERE file_path = ?",
+        (str(alpha_path),),
+    ).fetchone()[0]
+    assert path_count == 1
+
+
+def test_refresh_index_prunes_deleted_memory_files(tmp_path: Path):
+    """Rows for deleted memory files should be removed from the disposable cache."""
+    import shutil
+
+    fake_mem = tmp_path / "memory"
+    shutil.copytree(FIXTURE_MEMORY, fake_mem)
+    conn = open_index(tmp_path / "index.db")
+    build_full_index(conn, fake_mem)
+
+    zeta_path = fake_mem / "project_zeta.md"
+    zeta_path.unlink()
+
+    updated = refresh_index(conn, fake_mem)
+
+    assert updated >= 1
+    assert conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 7
+    assert conn.execute("SELECT name FROM projects WHERE name = 'Zeta Archive'").fetchone() is None
+    assert (
+        conn.execute("SELECT name FROM projects WHERE file_path = ?", (str(zeta_path),)).fetchone()
+        is None
+    )
+
+
+def test_refresh_index_prunes_all_when_no_memory_files_remain(tmp_path: Path):
+    """An existing empty memory directory should reconcile to an empty cache."""
+    conn = open_index(tmp_path / "index.db")
+    build_full_index(conn, FIXTURE_MEMORY)
+    empty_mem = tmp_path / "empty-memory"
+    empty_mem.mkdir()
+
+    updated = refresh_index(conn, empty_mem)
+
+    assert updated == 8
+    assert conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM projects_fts").fetchone()[0] == 0
+
+
+def test_build_full_index_prunes_all_when_no_memory_files_remain(tmp_path: Path):
+    """A full rebuild against an existing empty memory directory should clear stale rows."""
+    conn = open_index(tmp_path / "index.db")
+    build_full_index(conn, FIXTURE_MEMORY)
+    empty_mem = tmp_path / "empty-memory"
+    empty_mem.mkdir()
+
+    indexed = build_full_index(conn, empty_mem)
+
+    assert indexed == 0
+    assert conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM projects_fts").fetchone()[0] == 0
+
+
 # ---------------------------------------------------------------------------
 # maybe_refresh
 # ---------------------------------------------------------------------------
@@ -159,6 +289,41 @@ def test_maybe_refresh_noop(mem_conn: sqlite3.Connection):
 def test_maybe_refresh_missing_dir(mem_conn: sqlite3.Connection, tmp_path: Path):
     """maybe_refresh with a nonexistent directory should not raise."""
     maybe_refresh(mem_conn, tmp_path / "does_not_exist")
+
+
+def test_maybe_refresh_prunes_deleted_file_without_newer_remaining_mtime(tmp_path: Path):
+    """Deletion-only drift should refresh even when no remaining file has a newer mtime."""
+    import shutil
+
+    fake_mem = tmp_path / "memory"
+    shutil.copytree(FIXTURE_MEMORY, fake_mem)
+    conn = open_index(tmp_path / "index.db")
+    build_full_index(conn, fake_mem)
+
+    zeta_path = fake_mem / "project_zeta.md"
+    zeta_path.unlink()
+
+    maybe_refresh(conn, fake_mem)
+
+    assert conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 7
+    assert conn.execute("SELECT name FROM projects WHERE name = 'Zeta Archive'").fetchone() is None
+    assert (
+        conn.execute("SELECT name FROM projects WHERE file_path = ?", (str(zeta_path),)).fetchone()
+        is None
+    )
+
+
+def test_maybe_refresh_prunes_all_when_memory_dir_is_empty(tmp_path: Path):
+    """Server tool calls should clear stale rows after the last memory file disappears."""
+    conn = open_index(tmp_path / "index.db")
+    build_full_index(conn, FIXTURE_MEMORY)
+    empty_mem = tmp_path / "empty-memory"
+    empty_mem.mkdir()
+
+    maybe_refresh(conn, empty_mem)
+
+    assert conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM projects_fts").fetchone()[0] == 0
 
 
 # ---------------------------------------------------------------------------
