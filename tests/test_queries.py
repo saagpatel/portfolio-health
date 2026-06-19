@@ -5,11 +5,14 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from portfolio_health.indexer import build_full_index, open_index
 from portfolio_health.queries import (
+    _has_recent_git_commit,
+    _resolve_project_dir,
     get_project,
     list_active,
     search_projects,
@@ -659,3 +662,143 @@ def test_unshipped_no_bridge(index_conn, tmp_path):
     names = [r["name"] for r in results]
     # Alpha, Beta, Delta, Eta, Theta all have ship-ready descriptions
     assert len(names) >= 1
+
+
+# ---------------------------------------------------------------------------
+# git staleness fallback
+# ---------------------------------------------------------------------------
+
+
+def _make_bridge_no_activity(tmp_path: Path) -> Path:
+    """Helper: bridge-db with the schema but no activity rows for the target project."""
+    bridge_path = tmp_path / "bridge.db"
+    conn = sqlite3.connect(str(bridge_path))
+    conn.execute(
+        """CREATE TABLE activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            project_name TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            branch TEXT,
+            tags TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        )"""
+    )
+    conn.commit()
+    conn.close()
+    return bridge_path
+
+
+def _seed_project(conn: sqlite3.Connection, tmp_path: Path, name: str, slug: str) -> None:
+    conn.execute(
+        "INSERT INTO projects "
+        "(name, slug, file_path, description, status, mtime, frontmatter_json, body) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            name,
+            slug,
+            str(tmp_path / f"project_{slug}.md"),
+            "A test project",
+            "active",
+            1_000_000,
+            "{}",
+            "body text",
+        ),
+    )
+    conn.commit()
+
+
+def test_stale_candidates_git_rescue(tmp_path: Path) -> None:
+    """Project with no bridge activity but recent git commit should NOT appear in stale results."""
+    db_path = tmp_path / "index.db"
+    conn = open_index(db_path)
+    _seed_project(conn, tmp_path, "Afterimage", "afterimage")
+
+    bridge_path = _make_bridge_no_activity(tmp_path)
+
+    fake_dir = tmp_path / "Afterimage"
+    fake_dir.mkdir()
+
+    with (
+        patch("portfolio_health.queries._resolve_project_dir", return_value=fake_dir),
+        patch("portfolio_health.queries._has_recent_git_commit", return_value=True) as mock_git,
+    ):
+        results = stale_candidates(conn, days=90, bridge_path=bridge_path)
+
+    names = [r["name"] for r in results]
+    assert "Afterimage" not in names, (
+        "Project with recent git commit should be rescued from stale list"
+    )
+    mock_git.assert_called_once()
+
+
+def test_stale_candidates_truly_stale(tmp_path: Path) -> None:
+    """Project with no bridge activity AND no git commits should appear in stale results.
+
+    The git check is skipped when _resolve_project_dir returns None (no matching
+    ~/Projects/<name> dir), so we patch both helpers: resolve returns a fake dir
+    and _has_recent_git_commit returns False so the project stays stale.
+    """
+    db_path = tmp_path / "index.db"
+    conn = open_index(db_path)
+    _seed_project(conn, tmp_path, "DeadProject", "deadproject")
+
+    bridge_path = _make_bridge_no_activity(tmp_path)
+
+    fake_dir = tmp_path / "DeadProject"
+    fake_dir.mkdir()
+
+    with (
+        patch("portfolio_health.queries._resolve_project_dir", return_value=fake_dir),
+        patch("portfolio_health.queries._has_recent_git_commit", return_value=False) as mock_git,
+    ):
+        results = stale_candidates(conn, days=90, bridge_path=bridge_path)
+
+    names = [r["name"] for r in results]
+    assert "DeadProject" in names, (
+        "Project with no bridge activity and no git commits should be stale"
+    )
+    mock_git.assert_called_once()
+
+
+def test_has_recent_git_commit_missing_dir() -> None:
+    """Non-existent path returns False without raising."""
+    result = _has_recent_git_commit(Path("/nonexistent/path/xyz"), "2026-01-01")
+    assert result is False
+
+
+def test_resolve_project_dir_case_insensitive(tmp_path: Path) -> None:
+    """_resolve_project_dir finds a directory regardless of case.
+
+    On case-insensitive filesystems (macOS HFS+) the exact-name loop may return a
+    path with the *queried* casing that still resolves to the real directory.  We
+    therefore assert that the returned path is_dir() and its name matches
+    case-insensitively, rather than requiring an exact Path object match.
+    """
+    import portfolio_health.queries as q_mod
+
+    # Create a fake Projects root with an "Afterimage" directory
+    fake_projects = tmp_path / "Projects"
+    fake_projects.mkdir()
+    (fake_projects / "Afterimage").mkdir()
+
+    with patch.object(q_mod, "_PROJECTS_ROOT", fake_projects):
+        # Exact name
+        result_exact = q_mod._resolve_project_dir("Afterimage")
+        assert result_exact is not None and result_exact.is_dir()
+        assert result_exact.name.lower() == "afterimage"
+
+        # Lowercase variant — on a case-insensitive FS the candidate loop finds it
+        # directly; on a case-sensitive FS the fuzzy scan catches it
+        result_lower = q_mod._resolve_project_dir("afterimage")
+        assert result_lower is not None and result_lower.is_dir()
+        assert result_lower.name.lower() == "afterimage"
+
+        # Mixed case
+        result_upper = q_mod._resolve_project_dir("AFTERIMAGE")
+        assert result_upper is not None and result_upper.is_dir()
+        assert result_upper.name.lower() == "afterimage"
+
+        # Non-existent returns None
+        assert q_mod._resolve_project_dir("nonexistent") is None
