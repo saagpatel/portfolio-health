@@ -246,6 +246,34 @@ def test_refresh_index_prunes_deleted_memory_files(tmp_path: Path):
     )
 
 
+def test_refresh_index_prunes_all_when_no_memory_files_remain(tmp_path: Path):
+    """An existing empty memory directory should reconcile to an empty cache."""
+    conn = open_index(tmp_path / "index.db")
+    build_full_index(conn, FIXTURE_MEMORY)
+    empty_mem = tmp_path / "empty-memory"
+    empty_mem.mkdir()
+
+    updated = refresh_index(conn, empty_mem)
+
+    assert updated == 8
+    assert conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM projects_fts").fetchone()[0] == 0
+
+
+def test_build_full_index_prunes_all_when_no_memory_files_remain(tmp_path: Path):
+    """A full rebuild against an existing empty memory directory should clear stale rows."""
+    conn = open_index(tmp_path / "index.db")
+    build_full_index(conn, FIXTURE_MEMORY)
+    empty_mem = tmp_path / "empty-memory"
+    empty_mem.mkdir()
+
+    indexed = build_full_index(conn, empty_mem)
+
+    assert indexed == 0
+    assert conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM projects_fts").fetchone()[0] == 0
+
+
 # ---------------------------------------------------------------------------
 # maybe_refresh
 # ---------------------------------------------------------------------------
@@ -261,6 +289,41 @@ def test_maybe_refresh_noop(mem_conn: sqlite3.Connection):
 def test_maybe_refresh_missing_dir(mem_conn: sqlite3.Connection, tmp_path: Path):
     """maybe_refresh with a nonexistent directory should not raise."""
     maybe_refresh(mem_conn, tmp_path / "does_not_exist")
+
+
+def test_maybe_refresh_prunes_deleted_file_without_newer_remaining_mtime(tmp_path: Path):
+    """Deletion-only drift should refresh even when no remaining file has a newer mtime."""
+    import shutil
+
+    fake_mem = tmp_path / "memory"
+    shutil.copytree(FIXTURE_MEMORY, fake_mem)
+    conn = open_index(tmp_path / "index.db")
+    build_full_index(conn, fake_mem)
+
+    zeta_path = fake_mem / "project_zeta.md"
+    zeta_path.unlink()
+
+    maybe_refresh(conn, fake_mem)
+
+    assert conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 7
+    assert conn.execute("SELECT name FROM projects WHERE name = 'Zeta Archive'").fetchone() is None
+    assert (
+        conn.execute("SELECT name FROM projects WHERE file_path = ?", (str(zeta_path),)).fetchone()
+        is None
+    )
+
+
+def test_maybe_refresh_prunes_all_when_memory_dir_is_empty(tmp_path: Path):
+    """Server tool calls should clear stale rows after the last memory file disappears."""
+    conn = open_index(tmp_path / "index.db")
+    build_full_index(conn, FIXTURE_MEMORY)
+    empty_mem = tmp_path / "empty-memory"
+    empty_mem.mkdir()
+
+    maybe_refresh(conn, empty_mem)
+
+    assert conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM projects_fts").fetchone()[0] == 0
 
 
 # ---------------------------------------------------------------------------

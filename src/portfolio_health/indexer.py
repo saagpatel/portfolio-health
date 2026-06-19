@@ -134,7 +134,8 @@ def _index_max_mtime(conn: sqlite3.Connection) -> int:
 def _prune_missing_files(conn: sqlite3.Connection, file_paths: set[str]) -> int:
     """Remove cache rows whose backing memory file is no longer present."""
     if not file_paths:
-        return 0
+        cursor = conn.execute("DELETE FROM projects")
+        return cursor.rowcount
 
     placeholders = ",".join("?" for _ in file_paths)
     cursor = conn.execute(
@@ -295,11 +296,15 @@ def maybe_refresh(
     memory_dir: Path = DEFAULT_MEMORY_DIR,
 ) -> None:
     """Called at the start of every MCP tool call — cheap stat-based refresh."""
-    # If any file is newer than our max mtime, do the incremental pass
+    # If any file is newer or the cached path set drifted, do the incremental pass.
     current_max = _index_max_mtime(conn)
     needs_refresh = False
     try:
-        for path in memory_dir.glob("project_*.md"):
+        if not memory_dir.exists():
+            return
+        files = sorted(memory_dir.glob("project_*.md"))
+        current_paths = {str(path) for path in files}
+        for path in files:
             try:
                 if int(path.stat().st_mtime) > current_max:
                     needs_refresh = True
@@ -308,6 +313,11 @@ def maybe_refresh(
                 continue
     except OSError:
         return
+
+    if not needs_refresh:
+        cached_paths = [row["file_path"] for row in conn.execute("SELECT file_path FROM projects")]
+        if set(cached_paths) != current_paths or len(cached_paths) != len(current_paths):
+            needs_refresh = True
 
     if needs_refresh:
         refresh_index(conn, memory_dir)
