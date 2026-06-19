@@ -12,7 +12,7 @@ import pytest
 from portfolio_health.indexer import build_full_index, open_index
 from portfolio_health.queries import (
     _has_recent_git_commit,
-    _resolve_project_dir,
+    _load_activity_summary,
     get_project,
     list_active,
     search_projects,
@@ -802,3 +802,175 @@ def test_resolve_project_dir_case_insensitive(tmp_path: Path) -> None:
 
         # Non-existent returns None
         assert q_mod._resolve_project_dir("nonexistent") is None
+
+
+# ---------------------------------------------------------------------------
+# _load_activity_summary — single-scan rollup (T3-6)
+# ---------------------------------------------------------------------------
+
+
+def _make_bridge_with_trust(tmp_path: Path, rows: list[tuple]) -> Path:
+    """Bridge fixture whose activity_log carries the source_trust column.
+
+    rows: (source, timestamp, project_name, summary, tags, source_trust)
+    """
+    bridge_path = tmp_path / "bridge_trust.db"
+    conn = sqlite3.connect(str(bridge_path))
+    conn.execute(
+        """CREATE TABLE activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            project_name TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            branch TEXT,
+            tags TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            source_trust TEXT NOT NULL DEFAULT 'agent'
+                CHECK(source_trust IN ('operator', 'agent', 'ingested'))
+        )"""
+    )
+    conn.executemany(
+        "INSERT INTO activity_log"
+        " (source, timestamp, project_name, summary, tags, source_trust)"
+        " VALUES (?,?,?,?,?,?)",
+        rows,
+    )
+    conn.commit()
+    conn.close()
+    return bridge_path
+
+
+def test_load_activity_summary_aggregates_per_project(bridge_db):
+    summary = _load_activity_summary(bridge_db)
+    assert "Alpha Project" in summary
+    alpha = summary["Alpha Project"]
+    # Two non-boundary rows in the fixture.
+    assert len(alpha.activity_timestamps) == 2
+    # Contract: tuple is most-recent-first and last_ts is its head.
+    assert list(alpha.activity_timestamps) == sorted(alpha.activity_timestamps, reverse=True)
+    assert alpha.last_ts == alpha.activity_timestamps[0]
+    # last_summary is the summary of a real (non-boundary) Alpha row.
+    assert alpha.last_summary in {"Deployed v1.0 to TestFlight", "Fixed crash on launch"}
+
+
+def test_load_activity_summary_excludes_session_boundary(bridge_db):
+    conn = sqlite3.connect(str(bridge_db))
+    recent = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn.execute(
+        "INSERT INTO activity_log (source, timestamp, project_name, summary, tags)"
+        " VALUES (?,?,?,?,?)",
+        ("cc", recent, "Boundilo", "CC session ended", '["session-boundary"]'),
+    )
+    conn.commit()
+    conn.close()
+    summary = _load_activity_summary(bridge_db)
+    assert "Boundilo" not in summary, "session-boundary-only project must not appear"
+
+
+def test_load_activity_summary_tracks_shipped(bridge_db):
+    summary = _load_activity_summary(bridge_db)
+    # Alpha has exactly one SHIPPED row in the fixture.
+    alpha = summary["Alpha Project"]
+    assert alpha.last_shipped_ts is not None
+    assert len(alpha.shipped_timestamps) == 1
+    # Beta has no SHIPPED activity.
+    assert summary["Beta Dashboard"].last_shipped_ts is None
+    assert summary["Beta Dashboard"].shipped_timestamps == ()
+
+
+def test_load_activity_summary_missing_bridge(tmp_path):
+    assert _load_activity_summary(tmp_path / "nope.db") == {}
+
+
+def test_load_activity_summary_counts_all_when_no_trust_column(bridge_db):
+    """Fixtures without source_trust must not error and must count every row."""
+    summary = _load_activity_summary(bridge_db)
+    assert "Gamma CLI" in summary  # would raise 'no such column' if we assumed source_trust
+    # Every non-boundary row is counted (Alpha has 2) — proves rows aren't silently
+    # dropped on the pre-v7 schema, which this test's name promises.
+    assert len(summary["Alpha Project"].activity_timestamps) == 2
+
+
+def test_load_activity_summary_excludes_ingested_when_column_present(tmp_path):
+    """When source_trust exists, 'ingested' rows are dropped; operator/agent count."""
+    recent = (datetime.now(UTC) - timedelta(days=2)).strftime("%Y-%m-%d")
+    rows = [
+        ("ingest", recent, "Imported Repo", "auto-imported", "[]", "ingested"),
+        ("cc", recent, "Real Work", "operator did work", "[]", "operator"),
+        ("cc", recent, "Agent Work", "agent committed", "[]", "agent"),
+    ]
+    bridge = _make_bridge_with_trust(tmp_path, rows)
+    summary = _load_activity_summary(bridge)
+    assert "Imported Repo" not in summary, "ingested rows must not count as activity"
+    assert "Real Work" in summary
+    assert "Agent Work" in summary
+
+
+def test_load_activity_summary_ingested_shipped_does_not_ship(tmp_path):
+    """An ingested SHIPPED row must not register as a real ship event."""
+    recent = (datetime.now(UTC) - timedelta(days=2)).strftime("%Y-%m-%d")
+    rows = [
+        ("ingest", recent, "Faux Ship", "imported release note", '["SHIPPED"]', "ingested"),
+    ]
+    bridge = _make_bridge_with_trust(tmp_path, rows)
+    summary = _load_activity_summary(bridge)
+    assert "Faux Ship" not in summary
+
+
+def test_load_activity_summary_session_boundary_shipped_not_counted(bridge_db):
+    """A row tagged BOTH session-boundary and SHIPPED is a boundary marker, not a
+    ship event — it must register as neither activity nor a ship. This unifies the
+    boundary filtering that unshipped's first pass previously skipped."""
+    conn = sqlite3.connect(str(bridge_db))
+    recent = (datetime.now(UTC) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn.execute(
+        "INSERT INTO activity_log (source, timestamp, project_name, summary, tags)"
+        " VALUES (?,?,?,?,?)",
+        (
+            "cc",
+            recent,
+            "Boundary Ship",
+            "session ended after release",
+            '["session-boundary", "SHIPPED"]',
+        ),
+    )
+    conn.commit()
+    conn.close()
+    summary = _load_activity_summary(bridge_db)
+    assert "Boundary Ship" not in summary
+
+
+def test_unshipped_opens_bridge_once(index_conn, bridge_db):
+    """Regression: unshipped previously opened the bridge twice (bridge + bridge2)."""
+    import portfolio_health.queries as q
+
+    calls = {"n": 0}
+    real_open = q._open_bridge
+
+    def counting_open(path):
+        calls["n"] += 1
+        return real_open(path)
+
+    with patch.object(q, "_open_bridge", side_effect=counting_open):
+        unshipped(index_conn, bridge_path=bridge_db)
+    assert calls["n"] == 1, f"expected a single bridge open, got {calls['n']}"
+
+
+def test_stale_candidates_ingested_only_is_stale(tmp_path):
+    """A project whose only recent activity is `ingested` must read as STALE."""
+    from portfolio_health.indexer import open_index
+
+    conn = open_index(tmp_path / "index.db")
+    _seed_project(conn, tmp_path, "GhostRepo", "ghostrepo")
+
+    recent = (datetime.now(UTC) - timedelta(days=5)).strftime("%Y-%m-%d")
+    bridge = _make_bridge_with_trust(
+        tmp_path,
+        [("ingest", recent, "GhostRepo", "auto-imported commit", "[]", "ingested")],
+    )
+    # Block the git fallback so only bridge provenance decides staleness.
+    with patch("portfolio_health.queries._resolve_project_dir", return_value=None):
+        results = stale_candidates(conn, days=90, bridge_path=bridge)
+    names = [r["name"] for r in results]
+    assert "GhostRepo" in names, "ingested-only activity must not count as active"
