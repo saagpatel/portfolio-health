@@ -16,6 +16,8 @@ from portfolio_health.indexer import (
 )
 from portfolio_health.queries import DEFAULT_BRIDGE_PATH
 
+_PROJECT_HEALTH_COLUMNS = {"file_path", "slug"}
+
 
 def _open_readonly(path: Path) -> sqlite3.Connection | None:
     if not path.exists():
@@ -33,7 +35,17 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     return row is not None
 
 
-def _duplicate_values(conn: sqlite3.Connection, column: str) -> list[dict[str, Any]]:
+def _project_columns(conn: sqlite3.Connection) -> set[str]:
+    return {row["name"] for row in conn.execute("PRAGMA table_info(projects)").fetchall()}
+
+
+def _duplicate_values(
+    conn: sqlite3.Connection,
+    column: str,
+    columns: set[str],
+) -> list[dict[str, Any]]:
+    if column not in columns:
+        return []
     rows = conn.execute(
         f"""
         SELECT {column} AS value, COUNT(*) AS count
@@ -54,6 +66,8 @@ def _read_index_health(
     if not _table_exists(conn, "projects"):
         return {
             "schema_present": False,
+            "schema_current": False,
+            "missing_columns": ["projects"],
             "project_row_count": 0,
             "fts_row_count": 0,
             "distinct_file_paths": 0,
@@ -69,30 +83,40 @@ def _read_index_health(
     if _table_exists(conn, "projects_fts"):
         fts_row_count = int(conn.execute("SELECT COUNT(*) FROM projects_fts").fetchone()[0])
 
-    cached_paths = {
-        row["file_path"]
-        for row in conn.execute(
-            "SELECT file_path FROM projects WHERE file_path IS NOT NULL AND file_path != ''"
-        ).fetchall()
-    }
+    columns = _project_columns(conn)
+    missing_columns = sorted(_PROJECT_HEALTH_COLUMNS - columns)
+    if "file_path" in columns:
+        cached_paths = {
+            row["file_path"]
+            for row in conn.execute(
+                "SELECT file_path FROM projects WHERE file_path IS NOT NULL AND file_path != ''"
+            ).fetchall()
+        }
+    else:
+        cached_paths = set()
+
     stale_cached_paths = None
     missing_cached_files = None
-    if memory_paths is not None:
+    if memory_paths is not None and "file_path" in columns:
         stale_cached_paths = len(cached_paths - memory_paths)
         missing_cached_files = len(memory_paths - cached_paths)
 
-    distinct_slug_count = conn.execute(
-        "SELECT COUNT(DISTINCT slug) FROM projects WHERE slug IS NOT NULL"
-    ).fetchone()[0]
+    distinct_slug_count = 0
+    if "slug" in columns:
+        distinct_slug_count = conn.execute(
+            "SELECT COUNT(DISTINCT slug) FROM projects WHERE slug IS NOT NULL"
+        ).fetchone()[0]
 
     return {
         "schema_present": True,
+        "schema_current": not missing_columns,
+        "missing_columns": missing_columns,
         "project_row_count": project_row_count,
         "fts_row_count": fts_row_count,
         "distinct_file_paths": len(cached_paths),
         "distinct_slugs": int(distinct_slug_count),
-        "duplicate_file_paths": _duplicate_values(conn, "file_path"),
-        "duplicate_slugs": _duplicate_values(conn, "slug"),
+        "duplicate_file_paths": _duplicate_values(conn, "file_path", columns),
+        "duplicate_slugs": _duplicate_values(conn, "slug", columns),
         "stale_cached_paths": stale_cached_paths,
         "missing_cached_files": missing_cached_files,
     }
@@ -168,6 +192,8 @@ def collect_health(
         if conn is None:
             index_health = {
                 "schema_present": False,
+                "schema_current": False,
+                "missing_columns": ["projects"],
                 "project_row_count": 0,
                 "fts_row_count": 0,
                 "distinct_file_paths": 0,
@@ -194,6 +220,7 @@ def collect_health(
         "fts_matches_projects": index_health["fts_row_count"] == index_health["project_row_count"],
         "no_duplicate_file_paths": not index_health["duplicate_file_paths"],
         "no_duplicate_slugs": not index_health["duplicate_slugs"],
+        "index_schema_current": index_health["schema_current"],
         "bridge_activity_log_present": bridge_health["exists"] and bridge_health["schema_present"],
     }
     status = "ok" if all(checks.values()) and memory_exists else "warn"

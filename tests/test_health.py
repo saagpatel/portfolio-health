@@ -53,6 +53,8 @@ def test_collect_health_full_rebuild_reports_aligned_cache(tmp_path: Path):
     assert report["memory"]["project_file_count"] == 8
     assert report["index"]["project_row_count"] == 8
     assert report["index"]["fts_row_count"] == 8
+    assert report["index"]["schema_current"] is True
+    assert report["index"]["missing_columns"] == []
     assert report["index"]["stale_cached_paths"] == 0
     assert report["index"]["missing_cached_files"] == 0
     assert report["index"]["duplicate_file_paths"] == []
@@ -60,6 +62,58 @@ def test_collect_health_full_rebuild_reports_aligned_cache(tmp_path: Path):
     assert report["bridge"]["activity_row_count"] == 1
     assert report["bridge"]["latest_activity_timestamp"] == "2026-06-19T05:11:26Z"
     assert report["checks"]["bridge_activity_log_present"] is True
+
+
+def test_collect_health_readonly_warns_for_legacy_cache_without_slug(tmp_path: Path):
+    index_path = tmp_path / "legacy.db"
+    memory_dir = tmp_path / "memory"
+    bridge_path = tmp_path / "bridge.db"
+    memory_dir.mkdir()
+    legacy_file = memory_dir / "project_legacy.md"
+    legacy_file.write_text("---\nname: Legacy\n---\n\nBody\n", encoding="utf-8")
+    _make_bridge(bridge_path)
+
+    conn = sqlite3.connect(index_path)
+    conn.execute(
+        """
+        CREATE TABLE projects (
+            name TEXT PRIMARY KEY,
+            file_path TEXT NOT NULL,
+            description TEXT,
+            status TEXT,
+            mtime INTEGER NOT NULL,
+            frontmatter_json TEXT NOT NULL,
+            body TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE TABLE projects_fts (body TEXT)")
+    conn.execute(
+        """
+        INSERT INTO projects
+        (name, file_path, description, status, mtime, frontmatter_json, body)
+        VALUES (?,?,?,?,?,?,?)
+        """,
+        ("Legacy", str(legacy_file), "", "active", 1, "{}", "Body"),
+    )
+    conn.execute("INSERT INTO projects_fts (body) VALUES (?)", ("Body",))
+    conn.commit()
+    conn.close()
+
+    report = collect_health(
+        index_path=index_path,
+        memory_dir=memory_dir,
+        bridge_path=bridge_path,
+    )
+
+    assert report["status"] == "warn"
+    assert report["index"]["schema_present"] is True
+    assert report["index"]["schema_current"] is False
+    assert report["index"]["missing_columns"] == ["slug"]
+    assert report["index"]["project_row_count"] == 1
+    assert report["index"]["distinct_slugs"] == 0
+    assert report["index"]["duplicate_slugs"] == []
+    assert report["checks"]["index_schema_current"] is False
 
 
 def test_collect_health_readonly_reports_cache_drift(tmp_path: Path):
