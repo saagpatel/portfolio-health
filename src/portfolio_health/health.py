@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from portfolio_health.indexer import (
+    _PROJECTS_ROOT,
     DEFAULT_INDEX_PATH,
     DEFAULT_MEMORY_DIR,
     build_full_index,
@@ -175,7 +176,7 @@ def collect_health(
         refresh_mode = "full"
         conn = open_index(index_path)
         try:
-            refreshed_rows = build_full_index(conn, memory_dir)
+            refreshed_rows = build_full_index(conn, memory_dir, projects_root=_PROJECTS_ROOT)
             index_health = _read_index_health(conn, memory_paths)
         finally:
             conn.close()
@@ -183,7 +184,7 @@ def collect_health(
         refresh_mode = "incremental"
         conn = open_index(index_path)
         try:
-            refreshed_rows = refresh_index(conn, memory_dir)
+            refreshed_rows = refresh_index(conn, memory_dir, projects_root=_PROJECTS_ROOT)
             index_health = _read_index_health(conn, memory_paths)
         finally:
             conn.close()
