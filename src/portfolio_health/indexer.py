@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -11,8 +12,53 @@ from typing import Any
 
 import yaml
 
+
+def _resolve_memory_dir() -> Path:
+    """Resolve the Claude Code memory directory for the current user at import time.
+
+    Claude Code encodes the home directory path into the projects directory name by
+    replacing ``/`` with ``-``.  For example, a home of ``/home/alice`` becomes
+    ``-home-alice``, and the standard macOS home ``/Users/alice`` becomes ``-Users-alice``.
+
+    Resolution order:
+    1. ``PORTFOLIO_HEALTH_MEMORY_DIR`` environment variable (absolute path).
+    2. Auto-detect: scan ``~/.claude/projects/`` for the first subdirectory that
+       contains a ``memory/`` sub-directory with at least one ``project_*.md`` file.
+    3. Derive deterministically from ``Path.home()`` using the same encoding Claude
+       Code applies (leading ``/`` stripped, remaining ``/`` replaced with ``-``).
+
+    A missing directory does not raise at import time — callers that need the dir
+    to exist should check ``path.exists()`` themselves.
+    """
+    # 1. Explicit override via env var
+    env_override = os.environ.get("PORTFOLIO_HEALTH_MEMORY_DIR")
+    if env_override:
+        return Path(env_override).expanduser()
+
+    projects_root = Path.home() / ".claude" / "projects"
+
+    # 2. Auto-detect: find the encoded-home subdir that has memory/project_*.md
+    if projects_root.is_dir():
+        try:
+            for entry in sorted(projects_root.iterdir()):
+                if not entry.is_dir():
+                    continue
+                mem = entry / "memory"
+                if mem.is_dir() and any(mem.glob("project_*.md")):
+                    return mem
+        except OSError:
+            pass
+
+    # 3. Deterministic derivation: encode Path.home() the same way Claude Code does
+    #    e.g. /Users/alice  →  -Users-alice
+    home_str = str(Path.home())
+    encoded = home_str.lstrip("/").replace("/", "-")
+    encoded_segment = f"-{encoded}" if not encoded.startswith("-") else encoded
+    return projects_root / encoded_segment / "memory"
+
+
 # Default paths (overridable for tests)
-DEFAULT_MEMORY_DIR = Path.home() / ".claude/projects/-Users-d/memory"
+DEFAULT_MEMORY_DIR = _resolve_memory_dir()
 DEFAULT_INDEX_PATH = Path.home() / ".local/share/portfolio-health/index.db"
 _PROJECTS_ROOT = Path.home() / "Projects"
 
