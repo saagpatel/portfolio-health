@@ -12,6 +12,7 @@ import pytest
 from portfolio_health.indexer import build_full_index, open_index
 from portfolio_health.queries import (
     _load_activity_summary,
+    _has_recent_git_commit,
     get_project,
     list_active,
     search_projects,
