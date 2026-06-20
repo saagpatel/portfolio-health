@@ -22,10 +22,15 @@ def _resolve_memory_dir() -> Path:
 
     Resolution order:
     1. ``PORTFOLIO_HEALTH_MEMORY_DIR`` environment variable (absolute path).
-    2. Auto-detect: scan ``~/.claude/projects/`` for the first subdirectory that
-       contains a ``memory/`` sub-directory with at least one ``project_*.md`` file.
-    3. Derive deterministically from ``Path.home()`` using the same encoding Claude
-       Code applies (leading ``/`` stripped, remaining ``/`` replaced with ``-``).
+    2. Current-home encoded directory: derive ``~/.claude/projects/<encoded-home>/``
+       from ``Path.home()`` and return it immediately if it contains at least one
+       ``project_*.md`` file.  This prevents a stale encoded-home directory (e.g.
+       from a renamed user account) from being selected over the correct one.
+    3. Fallback glob: scan sibling directories under ``~/.claude/projects/`` for any
+       that contain a ``memory/project_*.md`` file (covers the edge case where the
+       home directory was recently renamed).
+    4. Deterministic derivation: return the canonical ``<encoded-home>/memory`` path
+       even if it does not exist yet — callers check ``path.exists()`` themselves.
 
     A missing directory does not raise at import time — callers that need the dir
     to exist should check ``path.exists()`` themselves.
@@ -37,11 +42,27 @@ def _resolve_memory_dir() -> Path:
 
     projects_root = Path.home() / ".claude" / "projects"
 
-    # 2. Auto-detect: find the encoded-home subdir that has memory/project_*.md
+    # Derive the encoded-home segment from Path.home() — Claude Code encodes the home
+    # path by stripping the leading "/" and replacing remaining "/" with "-".
+    # e.g. /Users/alice  →  -Users-alice
+    home_str = str(Path.home())
+    encoded = home_str.lstrip("/").replace("/", "-")
+    encoded_segment = f"-{encoded}" if not encoded.startswith("-") else encoded
+    current_home_mem = projects_root / encoded_segment / "memory"
+
+    # 2. Prefer the current-home encoded directory: if it exists and has project_*.md
+    #    files, return it immediately without scanning siblings.  This prevents a stale
+    #    encoded-home directory (e.g. from a previous macOS user account or a renamed
+    #    home) from winning just because it sorts first.
+    if current_home_mem.is_dir() and any(current_home_mem.glob("project_*.md")):
+        return current_home_mem
+
+    # 3. Fallback glob: scan siblings in case the current-home dir doesn't exist yet
+    #    but another encoded-home dir does (uncommon — e.g. home was recently renamed).
     if projects_root.is_dir():
         try:
             for entry in sorted(projects_root.iterdir()):
-                if not entry.is_dir():
+                if not entry.is_dir() or entry == current_home_mem.parent:
                     continue
                 mem = entry / "memory"
                 if mem.is_dir() and any(mem.glob("project_*.md")):
@@ -49,12 +70,9 @@ def _resolve_memory_dir() -> Path:
         except OSError:
             pass
 
-    # 3. Deterministic derivation: encode Path.home() the same way Claude Code does
-    #    e.g. /Users/alice  →  -Users-alice
-    home_str = str(Path.home())
-    encoded = home_str.lstrip("/").replace("/", "-")
-    encoded_segment = f"-{encoded}" if not encoded.startswith("-") else encoded
-    return projects_root / encoded_segment / "memory"
+    # 4. Deterministic derivation: return the canonical path even if it doesn't exist
+    #    yet — callers that need the dir to exist check path.exists() themselves.
+    return current_home_mem
 
 
 # Default paths (overridable for tests)
