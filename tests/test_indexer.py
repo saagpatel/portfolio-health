@@ -303,7 +303,7 @@ def test_maybe_refresh_prunes_deleted_file_without_newer_remaining_mtime(tmp_pat
     zeta_path = fake_mem / "project_zeta.md"
     zeta_path.unlink()
 
-    maybe_refresh(conn, fake_mem)
+    maybe_refresh(conn, fake_mem, projects_root=None)
 
     assert conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 7
     assert conn.execute("SELECT name FROM projects WHERE name = 'Zeta Archive'").fetchone() is None
@@ -320,7 +320,7 @@ def test_maybe_refresh_prunes_all_when_memory_dir_is_empty(tmp_path: Path):
     empty_mem = tmp_path / "empty-memory"
     empty_mem.mkdir()
 
-    maybe_refresh(conn, empty_mem)
+    maybe_refresh(conn, empty_mem, projects_root=None)
 
     assert conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM projects_fts").fetchone()[0] == 0
@@ -340,3 +340,69 @@ def test_open_index_idempotent(tmp_path: Path):
     count = conn2.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
     assert count == 0
     conn2.close()
+
+
+# ---------------------------------------------------------------------------
+# Git recency column (last_git_commit_ts)
+# ---------------------------------------------------------------------------
+
+
+def _init_repo_with_commit(path: Path) -> None:
+    import subprocess
+
+    def _g(args: list[str]) -> None:
+        subprocess.run(["git", *args], cwd=str(path), check=True, capture_output=True)
+
+    path.mkdir(parents=True, exist_ok=True)
+    _g(["init"])
+    _g(["config", "user.email", "t@example.invalid"])
+    _g(["config", "user.name", "T"])
+    (path / "f.txt").write_text("x\n")
+    _g(["add", "f.txt"])
+    _g(["commit", "-m", "c"])
+
+
+def test_default_build_skips_git_recency(mem_conn: sqlite3.Connection):
+    """Without an explicit projects_root, last_git_commit_ts stays NULL (hermetic default)."""
+    count = mem_conn.execute(
+        "SELECT COUNT(*) FROM projects WHERE last_git_commit_ts IS NOT NULL"
+    ).fetchone()[0]
+    assert count == 0
+
+
+def test_build_full_index_populates_git_recency(tmp_path: Path):
+    """With a projects_root containing a matching git repo, the column is populated."""
+    projects_root = tmp_path / "Projects"
+    _init_repo_with_commit(projects_root / "Alpha Project")
+
+    conn = open_index(tmp_path / "index.db")
+    build_full_index(conn, FIXTURE_MEMORY, projects_root=projects_root)
+
+    ts = conn.execute(
+        "SELECT last_git_commit_ts FROM projects WHERE name = 'Alpha Project'"
+    ).fetchone()[0]
+    assert ts is not None
+    # A project with no matching repo dir stays NULL.
+    none_ts = conn.execute(
+        "SELECT last_git_commit_ts FROM projects WHERE name = 'Gamma CLI'"
+    ).fetchone()[0]
+    assert none_ts is None
+
+
+def test_ensure_schema_migrates_missing_git_column(tmp_path: Path):
+    """An index predating last_git_commit_ts gains the column on open."""
+    import sqlite3 as _sqlite
+
+    db_path = tmp_path / "old.db"
+    raw = _sqlite.connect(str(db_path))
+    raw.execute(
+        "CREATE TABLE projects (name TEXT PRIMARY KEY, slug TEXT, file_path TEXT NOT NULL, "
+        "description TEXT, status TEXT, mtime INTEGER NOT NULL, frontmatter_json TEXT NOT NULL, "
+        "body TEXT NOT NULL)"
+    )
+    raw.commit()
+    raw.close()
+
+    conn = open_index(db_path)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(projects)")}
+    assert "last_git_commit_ts" in cols

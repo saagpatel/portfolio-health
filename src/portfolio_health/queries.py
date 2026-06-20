@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -64,49 +63,6 @@ def _sanitize_fts_query(query: str) -> str:
 
 
 DEFAULT_BRIDGE_PATH = Path.home() / ".local/share/bridge-db/bridge.db"
-_PROJECTS_ROOT = Path.home() / "Projects"
-
-
-def _has_recent_git_commit(project_dir: Path, cutoff_iso: str) -> bool:
-    """Return True if the project has a git commit since cutoff_iso."""
-    if not project_dir.is_dir():
-        return False
-    try:
-        result = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(project_dir),
-                "log",
-                "--since",
-                cutoff_iso,
-                "--oneline",
-                "--max-count=1",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-        return bool(result.stdout.strip())
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return False
-
-
-def _resolve_project_dir(name: str) -> Path | None:
-    """Try to find the project's git directory in ~/Projects/."""
-    # Try exact name, then titlecase, then lowercase, then uppercase
-    for candidate in [name, name.title(), name.lower(), name.upper()]:
-        p = _PROJECTS_ROOT / candidate
-        if p.is_dir():
-            return p
-    # Fuzzy: case-insensitive scan of ~/Projects/
-    try:
-        for entry in _PROJECTS_ROOT.iterdir():
-            if entry.is_dir() and entry.name.lower() == name.lower():
-                return entry
-    except OSError:
-        pass
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +328,7 @@ def stale_candidates(
     now = datetime.now(UTC)
 
     projects = index_conn.execute(
-        "SELECT name, slug, description, status, file_path FROM projects"
+        "SELECT name, slug, description, status, file_path, last_git_commit_ts FROM projects"
     ).fetchall()
 
     results = []
@@ -386,11 +342,12 @@ def stale_candidates(
         if name in active_names or slug in active_names or name.lower() in active_names:
             continue
 
-        # Git fallback: bridge says stale, but check git before accepting that.
-        # Only runs for projects bridge-db doesn't know about — keeps the common
-        # case (bridge says active) from touching the filesystem at all.
-        project_dir = _resolve_project_dir(name)
-        if project_dir is not None and _has_recent_git_commit(project_dir, cutoff):
+        # Git fallback: bridge says stale, but a recent commit means active. The
+        # git recency is precomputed into the index (last_git_commit_ts) at refresh
+        # time, so this stays a column read — no per-call subprocess. Lexicographic
+        # compare is valid: ISO timestamps and the bare-date cutoff both sort as TEXT.
+        git_ts = p["last_git_commit_ts"]
+        if git_ts and git_ts >= cutoff:
             continue  # git says active — not stale
 
         # Try multiple keys: display name, slug, lowercased name — first hit wins.

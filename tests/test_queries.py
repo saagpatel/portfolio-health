@@ -11,7 +11,6 @@ import pytest
 
 from portfolio_health.indexer import build_full_index, open_index
 from portfolio_health.queries import (
-    _has_recent_git_commit,
     _load_activity_summary,
     get_project,
     list_active,
@@ -710,98 +709,55 @@ def _seed_project(conn: sqlite3.Connection, tmp_path: Path, name: str, slug: str
 
 
 def test_stale_candidates_git_rescue(tmp_path: Path) -> None:
-    """Project with no bridge activity but recent git commit should NOT appear in stale results."""
-    db_path = tmp_path / "index.db"
-    conn = open_index(db_path)
+    """A recent commit recorded in last_git_commit_ts rescues a bridge-stale project."""
+    conn = open_index(tmp_path / "index.db")
     _seed_project(conn, tmp_path, "Afterimage", "afterimage")
+    recent = (datetime.now(UTC) - timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    conn.execute(
+        "UPDATE projects SET last_git_commit_ts = ? WHERE name = ?",
+        (recent, "Afterimage"),
+    )
+    conn.commit()
 
     bridge_path = _make_bridge_no_activity(tmp_path)
-
-    fake_dir = tmp_path / "Afterimage"
-    fake_dir.mkdir()
-
-    with (
-        patch("portfolio_health.queries._resolve_project_dir", return_value=fake_dir),
-        patch("portfolio_health.queries._has_recent_git_commit", return_value=True) as mock_git,
-    ):
-        results = stale_candidates(conn, days=90, bridge_path=bridge_path)
+    results = stale_candidates(conn, days=90, bridge_path=bridge_path)
 
     names = [r["name"] for r in results]
     assert "Afterimage" not in names, (
-        "Project with recent git commit should be rescued from stale list"
+        "Project with a recent git commit should be rescued from the stale list"
     )
-    mock_git.assert_called_once()
 
 
 def test_stale_candidates_truly_stale(tmp_path: Path) -> None:
-    """Project with no bridge activity AND no git commits should appear in stale results.
-
-    The git check is skipped when _resolve_project_dir returns None (no matching
-    ~/Projects/<name> dir), so we patch both helpers: resolve returns a fake dir
-    and _has_recent_git_commit returns False so the project stays stale.
-    """
-    db_path = tmp_path / "index.db"
-    conn = open_index(db_path)
-    _seed_project(conn, tmp_path, "DeadProject", "deadproject")
+    """No bridge activity AND no recorded git commit (column NULL) -> stale."""
+    conn = open_index(tmp_path / "index.db")
+    _seed_project(conn, tmp_path, "DeadProject", "deadproject")  # last_git_commit_ts NULL
 
     bridge_path = _make_bridge_no_activity(tmp_path)
-
-    fake_dir = tmp_path / "DeadProject"
-    fake_dir.mkdir()
-
-    with (
-        patch("portfolio_health.queries._resolve_project_dir", return_value=fake_dir),
-        patch("portfolio_health.queries._has_recent_git_commit", return_value=False) as mock_git,
-    ):
-        results = stale_candidates(conn, days=90, bridge_path=bridge_path)
+    results = stale_candidates(conn, days=90, bridge_path=bridge_path)
 
     names = [r["name"] for r in results]
     assert "DeadProject" in names, (
-        "Project with no bridge activity and no git commits should be stale"
+        "Project with no bridge activity and no git commit should be stale"
     )
-    mock_git.assert_called_once()
 
 
-def test_has_recent_git_commit_missing_dir() -> None:
-    """Non-existent path returns False without raising."""
-    result = _has_recent_git_commit(Path("/nonexistent/path/xyz"), "2026-01-01")
-    assert result is False
+def test_stale_candidates_old_git_commit_is_stale(tmp_path: Path) -> None:
+    """A git commit older than the window does not rescue a bridge-stale project."""
+    conn = open_index(tmp_path / "index.db")
+    _seed_project(conn, tmp_path, "OldProject", "oldproject")
+    old = (datetime.now(UTC) - timedelta(days=200)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    conn.execute(
+        "UPDATE projects SET last_git_commit_ts = ? WHERE name = ?",
+        (old, "OldProject"),
+    )
+    conn.commit()
 
+    bridge_path = _make_bridge_no_activity(tmp_path)
+    results = stale_candidates(conn, days=90, bridge_path=bridge_path)
 
-def test_resolve_project_dir_case_insensitive(tmp_path: Path) -> None:
-    """_resolve_project_dir finds a directory regardless of case.
-
-    On case-insensitive filesystems (macOS HFS+) the exact-name loop may return a
-    path with the *queried* casing that still resolves to the real directory.  We
-    therefore assert that the returned path is_dir() and its name matches
-    case-insensitively, rather than requiring an exact Path object match.
-    """
-    import portfolio_health.queries as q_mod
-
-    # Create a fake Projects root with an "Afterimage" directory
-    fake_projects = tmp_path / "Projects"
-    fake_projects.mkdir()
-    (fake_projects / "Afterimage").mkdir()
-
-    with patch.object(q_mod, "_PROJECTS_ROOT", fake_projects):
-        # Exact name
-        result_exact = q_mod._resolve_project_dir("Afterimage")
-        assert result_exact is not None and result_exact.is_dir()
-        assert result_exact.name.lower() == "afterimage"
-
-        # Lowercase variant — on a case-insensitive FS the candidate loop finds it
-        # directly; on a case-sensitive FS the fuzzy scan catches it
-        result_lower = q_mod._resolve_project_dir("afterimage")
-        assert result_lower is not None and result_lower.is_dir()
-        assert result_lower.name.lower() == "afterimage"
-
-        # Mixed case
-        result_upper = q_mod._resolve_project_dir("AFTERIMAGE")
-        assert result_upper is not None and result_upper.is_dir()
-        assert result_upper.name.lower() == "afterimage"
-
-        # Non-existent returns None
-        assert q_mod._resolve_project_dir("nonexistent") is None
+    names = [r["name"] for r in results]
+    assert "OldProject" in names, "A commit older than the window must not rescue"
 
 
 # ---------------------------------------------------------------------------
@@ -962,15 +918,13 @@ def test_stale_candidates_ingested_only_is_stale(tmp_path):
     from portfolio_health.indexer import open_index
 
     conn = open_index(tmp_path / "index.db")
-    _seed_project(conn, tmp_path, "GhostRepo", "ghostrepo")
+    _seed_project(conn, tmp_path, "GhostRepo", "ghostrepo")  # last_git_commit_ts NULL
 
     recent = (datetime.now(UTC) - timedelta(days=5)).strftime("%Y-%m-%d")
     bridge = _make_bridge_with_trust(
         tmp_path,
         [("ingest", recent, "GhostRepo", "auto-imported commit", "[]", "ingested")],
     )
-    # Block the git fallback so only bridge provenance decides staleness.
-    with patch("portfolio_health.queries._resolve_project_dir", return_value=None):
-        results = stale_candidates(conn, days=90, bridge_path=bridge)
+    results = stale_candidates(conn, days=90, bridge_path=bridge)
     names = [r["name"] for r in results]
     assert "GhostRepo" in names, "ingested-only activity must not count as active"

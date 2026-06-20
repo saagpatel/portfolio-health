@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ import yaml
 # Default paths (overridable for tests)
 DEFAULT_MEMORY_DIR = Path.home() / ".claude/projects/-Users-d/memory"
 DEFAULT_INDEX_PATH = Path.home() / ".local/share/portfolio-health/index.db"
+_PROJECTS_ROOT = Path.home() / "Projects"
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
 _SLUG_NON_ALNUM = re.compile(r"[^a-z0-9]+")
@@ -83,7 +85,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             status TEXT,
             mtime INTEGER NOT NULL,
             frontmatter_json TEXT NOT NULL,
-            body TEXT NOT NULL
+            body TEXT NOT NULL,
+            last_git_commit_ts TEXT
         );
 
         CREATE VIRTUAL TABLE IF NOT EXISTS projects_fts
@@ -114,7 +117,74 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(projects)")}
     if "slug" not in existing_cols:
         conn.execute("ALTER TABLE projects ADD COLUMN slug TEXT")
+    if "last_git_commit_ts" not in existing_cols:
+        conn.execute("ALTER TABLE projects ADD COLUMN last_git_commit_ts TEXT")
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Git recency — precomputed into the index so stale_candidates stays a pure
+# column read (no per-query subprocess fan-out).
+# ---------------------------------------------------------------------------
+
+
+def _resolve_project_dir(name: str, projects_root: Path = _PROJECTS_ROOT) -> Path | None:
+    """Find the project's git directory under *projects_root* (default ~/Projects)."""
+    for candidate in (name, name.title(), name.lower(), name.upper()):
+        p = projects_root / candidate
+        if p.is_dir():
+            return p
+    try:
+        for entry in projects_root.iterdir():
+            if entry.is_dir() and entry.name.lower() == name.lower():
+                return entry
+    except OSError:
+        pass
+    return None
+
+
+def _last_git_commit_iso(project_dir: Path) -> str | None:
+    """Last commit's committer date (strict ISO 8601), or None.
+
+    None when the directory is missing, is not a git repo, has no commits, or git
+    is unavailable — the column then reads as "no git signal" and staleness falls
+    back to bridge activity alone.
+    """
+    if not project_dir.is_dir():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_dir), "log", "-1", "--format=%cI"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    return result.stdout.strip() or None
+
+
+def _refresh_git_recency(conn: sqlite3.Connection, projects_root: Path) -> None:
+    """Update last_git_commit_ts for every indexed project from on-disk git state.
+
+    Runs at index-refresh time, not per query: this is what lets stale_candidates
+    read a column instead of shelling out to git N times on every call. Only rows
+    whose value actually changes are written, so the FTS-sync trigger stays quiet
+    for the common no-op refresh.
+    """
+    rows = conn.execute("SELECT name, last_git_commit_ts FROM projects").fetchall()
+    changed = False
+    for row in rows:
+        project_dir = _resolve_project_dir(row["name"], projects_root)
+        new_ts = _last_git_commit_iso(project_dir) if project_dir is not None else None
+        if new_ts != row["last_git_commit_ts"]:
+            conn.execute(
+                "UPDATE projects SET last_git_commit_ts = ? WHERE name = ?",
+                (new_ts, row["name"]),
+            )
+            changed = True
+    if changed:
+        conn.commit()
 
 
 def open_index(index_path: Path = DEFAULT_INDEX_PATH) -> sqlite3.Connection:
@@ -222,6 +292,7 @@ def _upsert_project(conn: sqlite3.Connection, data: dict[str, Any]) -> None:
 def refresh_index(
     conn: sqlite3.Connection,
     memory_dir: Path = DEFAULT_MEMORY_DIR,
+    projects_root: Path | None = None,
 ) -> int:
     """Incrementally refresh index for changed files and prune stale cache rows.
 
@@ -265,12 +336,16 @@ def refresh_index(
     if updated:
         conn.commit()
 
+    if projects_root is not None:
+        _refresh_git_recency(conn, projects_root)
+
     return updated
 
 
 def build_full_index(
     conn: sqlite3.Connection,
     memory_dir: Path = DEFAULT_MEMORY_DIR,
+    projects_root: Path | None = None,
 ) -> int:
     """Index ALL project_*.md files regardless of mtime (used in tests / force-rebuild)."""
     if not memory_dir.exists():
@@ -288,12 +363,15 @@ def build_full_index(
         indexed += 1
     if indexed or pruned:
         conn.commit()
+    if projects_root is not None:
+        _refresh_git_recency(conn, projects_root)
     return indexed
 
 
 def maybe_refresh(
     conn: sqlite3.Connection,
     memory_dir: Path = DEFAULT_MEMORY_DIR,
+    projects_root: Path | None = None,
 ) -> None:
     """Called at the start of every MCP tool call — cheap stat-based refresh."""
     # If any file is newer or the cached path set drifted, do the incremental pass.
@@ -320,4 +398,4 @@ def maybe_refresh(
             needs_refresh = True
 
     if needs_refresh:
-        refresh_index(conn, memory_dir)
+        refresh_index(conn, memory_dir, projects_root)

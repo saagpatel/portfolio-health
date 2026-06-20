@@ -7,8 +7,10 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 from portfolio_health.indexer import (
+    _PROJECTS_ROOT,
     DEFAULT_INDEX_PATH,
     DEFAULT_MEMORY_DIR,
+    _refresh_git_recency,
     maybe_refresh,
     open_index,
 )
@@ -33,7 +35,12 @@ def _get_conn():
     global _conn
     if _conn is None:
         _conn = open_index(DEFAULT_INDEX_PATH)
-    maybe_refresh(_conn, _memory_dir)
+        # One-time git-recency populate at process start: closes the cold-start gap
+        # where a freshly migrated index has a NULL last_git_commit_ts column and
+        # stale_candidates would briefly miss git-active rescues until a memory edit.
+        _refresh_git_recency(_conn, _PROJECTS_ROOT)
+    # Ongoing: markdown-change-triggered refresh also refreshes git recency.
+    maybe_refresh(_conn, _memory_dir, projects_root=_PROJECTS_ROOT)
     return _conn
 
 

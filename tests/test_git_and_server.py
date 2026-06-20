@@ -1,13 +1,12 @@
-"""Real-subprocess tests for _has_recent_git_commit and server.py global-conn reuse."""
+"""Real-subprocess tests for the indexer git-recency helpers and server global-conn reuse."""
 
 from __future__ import annotations
 
 import subprocess
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from portfolio_health.queries import _has_recent_git_commit
+from portfolio_health.indexer import _last_git_commit_iso, _resolve_project_dir
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -34,42 +33,53 @@ def _make_real_git_repo(tmp_path: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Real-subprocess tests for _has_recent_git_commit
+# Real-subprocess tests for the indexer git-recency helpers
 # ---------------------------------------------------------------------------
 
 
-def test_has_recent_git_commit_real_repo(tmp_path: Path) -> None:
-    """A repo with a commit today returns True against a past cutoff date."""
+def test_last_git_commit_iso_real_repo(tmp_path: Path) -> None:
+    """A repo with one commit yields a strict-ISO committer timestamp."""
     repo = _make_real_git_repo(tmp_path)
+    ts = _last_git_commit_iso(repo)
+    assert ts is not None
+    from datetime import datetime as _dt
 
-    # cutoff yesterday — the commit we just made is newer, so should return True
-    yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
-    assert _has_recent_git_commit(repo, yesterday) is True
-
-
-def test_has_recent_git_commit_future_cutoff(tmp_path: Path) -> None:
-    """Cutoff in the future means no commit is recent enough — returns False."""
-    repo = _make_real_git_repo(tmp_path)
-
-    tomorrow = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
-    assert _has_recent_git_commit(repo, tomorrow) is False
+    # %cI is strict ISO 8601 — fromisoformat parses it without massaging.
+    assert _dt.fromisoformat(ts).year >= 2024
 
 
-def test_has_recent_git_commit_not_a_git_repo(tmp_path: Path) -> None:
-    """A real directory that is NOT a git repo returns False without raising."""
+def test_last_git_commit_iso_not_a_git_repo(tmp_path: Path) -> None:
+    """A real directory that is NOT a git repo returns None without raising."""
     plain_dir = tmp_path / "plain_dir"
     plain_dir.mkdir()
-    # git log on a non-git dir exits nonzero; the function must swallow that
-    yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
-    result = _has_recent_git_commit(plain_dir, yesterday)
-    assert result is False
+    assert _last_git_commit_iso(plain_dir) is None
 
 
-def test_has_recent_git_commit_nonexistent_dir(tmp_path: Path) -> None:
-    """A path that does not exist at all returns False."""
-    missing = tmp_path / "does_not_exist"
-    result = _has_recent_git_commit(missing, "2026-01-01")
-    assert result is False
+def test_last_git_commit_iso_nonexistent_dir(tmp_path: Path) -> None:
+    """A path that does not exist at all returns None."""
+    assert _last_git_commit_iso(tmp_path / "does_not_exist") is None
+
+
+def test_last_git_commit_iso_empty_repo(tmp_path: Path) -> None:
+    """An initialized repo with no commits returns None (no committer date)."""
+    repo = tmp_path / "empty_repo"
+    repo.mkdir()
+    _git(["init"], repo)
+    assert _last_git_commit_iso(repo) is None
+
+
+def test_resolve_project_dir_case_insensitive(tmp_path: Path) -> None:
+    """_resolve_project_dir finds a directory regardless of case, scoped to projects_root."""
+    fake_projects = tmp_path / "Projects"
+    fake_projects.mkdir()
+    (fake_projects / "Afterimage").mkdir()
+
+    for query in ("Afterimage", "afterimage", "AFTERIMAGE"):
+        result = _resolve_project_dir(query, fake_projects)
+        assert result is not None and result.is_dir()
+        assert result.name.lower() == "afterimage"
+
+    assert _resolve_project_dir("nonexistent", fake_projects) is None
 
 
 # ---------------------------------------------------------------------------
@@ -165,3 +175,52 @@ def test_maybe_refresh_called_on_each_get_conn(tmp_path: Path) -> None:
         srv._get_conn()
         # Called once per _get_conn() invocation — including on reuse
         assert mock_refresh.call_count == 2
+
+
+def test_get_conn_populates_git_recency_on_cold_start(tmp_path: Path) -> None:
+    """A freshly migrated index (NULL git column) gets populated on the first
+    _get_conn(), even with no memory change — closes the cold-start gap."""
+    import portfolio_health.server as srv
+    from portfolio_health.indexer import build_full_index, open_index
+
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    (memory / "project_afterimage.md").write_text(
+        "---\nname: Afterimage\ndescription: d\ntype: project\nstatus: active\n---\n\nbody\n"
+    )
+
+    projects_root = tmp_path / "Projects"
+    repo = projects_root / "Afterimage"
+    repo.mkdir(parents=True)
+    _git(["init"], repo)
+    _git(["config", "user.email", "t@example.invalid"], repo)
+    _git(["config", "user.name", "T"], repo)
+    (repo / "f.txt").write_text("x\n")
+    _git(["add", "f.txt"], repo)
+    _git(["commit", "-m", "c"], repo)
+
+    # Pre-build the index with the git column left NULL, as a migrated-but-unscanned
+    # index would be.
+    index_path = tmp_path / "index.db"
+    seed = open_index(index_path)
+    build_full_index(seed, memory, projects_root=None)
+    assert (
+        seed.execute(
+            "SELECT last_git_commit_ts FROM projects WHERE name = 'Afterimage'"
+        ).fetchone()[0]
+        is None
+    )
+    seed.close()
+
+    with (
+        patch.object(srv, "_conn", None),
+        patch("portfolio_health.server.DEFAULT_INDEX_PATH", index_path),
+        patch("portfolio_health.server._PROJECTS_ROOT", projects_root),
+        patch("portfolio_health.server._memory_dir", memory),
+    ):
+        conn = srv._get_conn()
+        ts = conn.execute(
+            "SELECT last_git_commit_ts FROM projects WHERE name = 'Afterimage'"
+        ).fetchone()[0]
+
+    assert ts is not None, "cold-start _get_conn must populate last_git_commit_ts"
