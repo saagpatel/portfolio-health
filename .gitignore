@@ -10,3 +10,4 @@ build/
 htmlcov/
 .ruff_cache/
 .DS_Store
+.claude/
