@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -62,7 +63,19 @@ def _sanitize_fts_query(query: str) -> str:
     return " ".join(f"{t}*" for t in tokens)
 
 
-DEFAULT_BRIDGE_PATH = Path.home() / ".local/share/bridge-db/bridge.db"
+def _resolve_default_bridge_path() -> Path:
+    """Resolve the bridge-db path, honoring the ``PORTFOLIO_HEALTH_BRIDGE_DB``
+    environment override (parity with ``PORTFOLIO_HEALTH_MEMORY_DIR`` in indexer.py)
+    before falling back to the standard ~/.local/share location. This keeps
+    portfolio-health working if bridge-db is relocated.
+    """
+    env_override = os.environ.get("PORTFOLIO_HEALTH_BRIDGE_DB")
+    if env_override:
+        return Path(env_override).expanduser()
+    return Path.home() / ".local/share/bridge-db/bridge.db"
+
+
+DEFAULT_BRIDGE_PATH = _resolve_default_bridge_path()
 
 
 # ---------------------------------------------------------------------------

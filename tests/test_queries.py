@@ -928,3 +928,33 @@ def test_stale_candidates_ingested_only_is_stale(tmp_path):
     results = stale_candidates(conn, days=90, bridge_path=bridge)
     names = [r["name"] for r in results]
     assert "GhostRepo" in names, "ingested-only activity must not count as active"
+
+
+# ---------------------------------------------------------------------------
+# Bridge-db path resolution — PORTFOLIO_HEALTH_BRIDGE_DB override (parity with
+# the PORTFOLIO_HEALTH_MEMORY_DIR override in indexer.py)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_default_bridge_path_honors_env_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from portfolio_health.queries import _resolve_default_bridge_path
+
+    custom = tmp_path / "custom" / "bridge.db"
+    monkeypatch.setenv("PORTFOLIO_HEALTH_BRIDGE_DB", str(custom))
+    assert _resolve_default_bridge_path() == custom
+
+
+def test_resolve_default_bridge_path_expands_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    from portfolio_health.queries import _resolve_default_bridge_path
+
+    monkeypatch.setenv("PORTFOLIO_HEALTH_BRIDGE_DB", "~/moved/bridge.db")
+    assert _resolve_default_bridge_path() == Path.home() / "moved" / "bridge.db"
+
+
+def test_resolve_default_bridge_path_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    from portfolio_health.queries import _resolve_default_bridge_path
+
+    monkeypatch.delenv("PORTFOLIO_HEALTH_BRIDGE_DB", raising=False)
+    assert _resolve_default_bridge_path() == Path.home() / ".local/share/bridge-db/bridge.db"
