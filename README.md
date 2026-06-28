@@ -105,7 +105,7 @@ Add to your Claude Code `mcp.json` or `~/.claude/claude_desktop_config.json`:
 }
 ```
 
-Replace `/path/to/portfolio-health` with the absolute path to your clone. If the memory directory is not auto-detected, add it as an env var:
+Replace `/path/to/portfolio-health` with the absolute path to your clone. If the memory directory is not auto-detected, or bridge-db lives outside the default `~/.local/share` location, set the matching env vars:
 
 ```json
 {
@@ -114,12 +114,15 @@ Replace `/path/to/portfolio-health` with the absolute path to your clone. If the
       "command": "uv",
       "args": ["run", "--directory", "/path/to/portfolio-health", "python", "-m", "portfolio_health"],
       "env": {
-        "PORTFOLIO_HEALTH_MEMORY_DIR": "/path/to/.claude/projects/<encoded-home>/memory"
+        "PORTFOLIO_HEALTH_MEMORY_DIR": "/path/to/.claude/projects/<encoded-home>/memory",
+        "PORTFOLIO_HEALTH_BRIDGE_DB": "/path/to/.local/share/bridge-db/bridge.db"
       }
     }
   }
 }
 ```
+
+`PORTFOLIO_HEALTH_BRIDGE_DB` overrides the bridge-db path (default `~/.local/share/bridge-db/bridge.db`); `PORTFOLIO_HEALTH_MEMORY_DIR` overrides the memory directory.
 
 ## Dev
 
