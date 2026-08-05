@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from portfolio_health.indexer import (
+    _enable_wal,
     build_full_index,
     maybe_refresh,
     open_index,
@@ -71,6 +72,105 @@ def test_parse_body_present():
 def test_parse_missing_file():
     result = parse_memory_file(Path("/nonexistent/project_fake.md"))
     assert result is None
+
+
+def test_parse_frontmatter_unquoted_timestamp(tmp_path: Path):
+    """PyYAML resolves an unquoted ISO timestamp to a datetime, which json cannot encode.
+
+    Regression for 2026-08-04: a ``modified:`` key added to a real memory file made
+    json.dumps raise inside parse_memory_file.
+    """
+    path = tmp_path / "project_stamped.md"
+    path.write_text(
+        "---\n"
+        "name: Stamped Project\n"
+        "description: has an unquoted timestamp\n"
+        "modified: 2026-08-05T03:17:27Z\n"
+        "reviewed_on: 2026-07-26\n"
+        "---\n\nBody text.\n",
+        encoding="utf-8",
+    )
+
+    data = parse_memory_file(path)
+
+    assert data is not None
+    fm = json.loads(data["frontmatter_json"])
+    assert fm["modified"].startswith("2026-08-05T03:17:27")
+    assert fm["reviewed_on"] == "2026-07-26"
+
+
+def test_refresh_index_survives_unquoted_timestamp(tmp_path: Path):
+    """One bad frontmatter scalar must not take the whole index down.
+
+    Every MCP tool refreshes before querying, so a raise here failed all five tools,
+    not just the project that carried the timestamp.
+    """
+    mem = tmp_path / "memory"
+    mem.mkdir()
+    (mem / "project_good.md").write_text(
+        "---\nname: Good\ndescription: fine\n---\n\nBody.\n", encoding="utf-8"
+    )
+    (mem / "project_stamped.md").write_text(
+        "---\nname: Stamped\ndescription: bad scalar\nmodified: 2026-08-05T03:17:27Z\n"
+        "---\n\nBody.\n",
+        encoding="utf-8",
+    )
+    conn = open_index(tmp_path / "index.db")
+
+    refresh_index(conn, mem)
+
+    names = {row[0] for row in conn.execute("SELECT name FROM projects")}
+    assert names == {"Good", "Stamped"}
+
+
+def test_open_index_uses_wal(tmp_path: Path):
+    """WAL keeps concurrent session server processes from locking each other out."""
+    conn = open_index(tmp_path / "index.db")
+
+    mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+
+    assert mode.lower() == "wal"
+
+
+def test_failed_refresh_releases_the_write_lock(tmp_path: Path, monkeypatch):
+    """A raise mid-refresh must not leave a write transaction open.
+
+    The connection is module-level in the MCP server and outlives the call, so a
+    stranded RESERVED lock presents to every other session as "database is locked"
+    until the process dies.
+    """
+    mem = tmp_path / "memory"
+    mem.mkdir()
+    (mem / "project_one.md").write_text("---\nname: One\n---\n\nBody.\n", encoding="utf-8")
+    conn = open_index(tmp_path / "index.db")
+    build_full_index(conn, mem)
+    (mem / "project_two.md").write_text("---\nname: Two\n---\n\nBody.\n", encoding="utf-8")
+
+    def boom(_path):
+        raise TypeError("Object of type datetime is not JSON serializable")
+
+    monkeypatch.setattr("portfolio_health.indexer.parse_memory_file", boom)
+
+    with pytest.raises(TypeError):
+        refresh_index(conn, mem)
+
+    assert conn.in_transaction is False
+
+
+def test_enable_wal_survives_a_locked_database(tmp_path: Path, capsys):
+    """A sibling process holding the index must not make opening it fail.
+
+    Switching journal mode needs an exclusive lock; running on the old mode is
+    strictly better than refusing to open.
+    """
+
+    class LockedConn:
+        def execute(self, sql: str):
+            raise sqlite3.OperationalError("database is locked")
+
+    _enable_wal(LockedConn(), tmp_path / "index.db")
+
+    assert "could not switch" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

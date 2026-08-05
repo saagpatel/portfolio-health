@@ -7,10 +7,30 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+
+def _json_safe(value: Any) -> str:
+    """Coerce a YAML scalar that ``json`` cannot encode into a string.
+
+    PyYAML resolves an unquoted ISO date or timestamp in frontmatter (``modified:
+    2026-08-05T03:17:27Z``) into a ``date``/``datetime`` object rather than a string.
+    ``json.dumps`` then raises ``TypeError: Object of type datetime is not JSON
+    serializable``, and because every tool refreshes the index before querying, one
+    such key took down all five MCP tools rather than the one project it appeared in
+    (observed 2026-08-04). Dates round-trip as ISO 8601; anything else degrades to
+    ``str`` so an unexpected scalar can never again break the whole index.
+    """
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return str(value)
 
 
 def _resolve_memory_dir() -> Path:
@@ -78,6 +98,9 @@ def _resolve_memory_dir() -> Path:
 # Default paths (overridable for tests)
 DEFAULT_MEMORY_DIR = _resolve_memory_dir()
 DEFAULT_INDEX_PATH = Path.home() / ".local/share/portfolio-health/index.db"
+# Seconds a connection waits on a lock held by another session's server process
+# before giving up. See open_index for why concurrent writers are expected here.
+_BUSY_TIMEOUT_SECONDS = 10.0
 _PROJECTS_ROOT = Path.home() / "Projects"
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
@@ -133,7 +156,7 @@ def parse_memory_file(path: Path) -> dict[str, Any] | None:
         "description": description,
         "status": status,
         "mtime": int(path.stat().st_mtime),
-        "frontmatter_json": json.dumps(frontmatter),
+        "frontmatter_json": json.dumps(frontmatter, default=_json_safe),
         "body": body.strip(),
     }
 
@@ -252,12 +275,60 @@ def _refresh_git_recency(conn: sqlite3.Connection, projects_root: Path) -> None:
 
 
 def open_index(index_path: Path = DEFAULT_INDEX_PATH) -> sqlite3.Connection:
-    """Open (creating if needed) the index database. Schema is guaranteed."""
+    """Open (creating if needed) the index database. Schema is guaranteed.
+
+    Every Claude Code session starts its own MCP server process, and each one both
+    reads and writes this file. Under SQLite's default rollback journal a single
+    writer locks out every reader, so concurrent sessions surfaced as "database is
+    locked" on all five tools (observed 2026-08-04 with two live server processes
+    holding the index). WAL lets readers proceed while one writer works, and the
+    connect timeout gives the remaining writer-writer overlap room to resolve
+    instead of failing the call outright.
+    """
     index_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(index_path))
+    conn = sqlite3.connect(str(index_path), timeout=_BUSY_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
+    _enable_wal(conn, index_path)
     _ensure_schema(conn)
     return conn
+
+
+def _enable_wal(conn: sqlite3.Connection, index_path: Path) -> None:
+    """Switch the index to WAL, tolerating a process that already holds it.
+
+    Changing journal mode needs an exclusive lock, which a sibling session's server
+    process holding the index in rollback mode will not yield. The mode is persisted
+    in the database header, so the first start that finds no contender converts the
+    file for everyone afterwards; until then the connect timeout still absorbs
+    ordinary contention. Refusing to open at all would be strictly worse than running
+    on the old journal mode, so report it and continue.
+    """
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError as exc:
+        print(
+            f"portfolio-health: could not switch {index_path} to WAL ({exc}); "
+            "continuing on the existing journal mode",
+            file=sys.stderr,
+        )
+
+
+@contextmanager
+def _write_transaction(conn: sqlite3.Connection) -> Iterator[None]:
+    """Roll back on any error so a failed refresh cannot strand a write lock.
+
+    The first DELETE of a refresh opens a write transaction. Leaving this block with
+    that transaction open holds a RESERVED lock on a connection that lives as long as
+    the server process, which every other session then sees as "database is locked" —
+    forever, since nothing ever closes it. That is how a single unencodable frontmatter
+    value took down portfolio-health machine-wide on 2026-08-04 rather than failing the
+    one call that hit it. Release the lock, then let the caller see the real error.
+    """
+    try:
+        yield
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 def _index_max_mtime(conn: sqlite3.Connection) -> int:
@@ -370,35 +441,37 @@ def refresh_index(
 
     files = sorted(memory_dir.glob("project_*.md"))
     current_paths = {str(path) for path in files}
-    updated += _prune_missing_files(conn, current_paths)
 
-    for path in files:
-        try:
-            file_mtime = int(path.stat().st_mtime)
-        except OSError:
-            continue
+    with _write_transaction(conn):
+        updated += _prune_missing_files(conn, current_paths)
 
-        rows = conn.execute(
-            "SELECT name, mtime FROM projects WHERE file_path = ?",
-            (str(path),),
-        ).fetchall()
-        if file_mtime <= current_max:
-            # Check if this specific file is already in the index at this mtime.
-            # If duplicate rows exist for the same file path, parse once and let
-            # _upsert_project collapse the stale display-name rows.
-            current_row = next((row for row in rows if int(row["mtime"]) >= file_mtime), None)
-            if len(rows) == 1 and current_row:
+        for path in files:
+            try:
+                file_mtime = int(path.stat().st_mtime)
+            except OSError:
                 continue
 
-        data = parse_memory_file(path)
-        if data is None:
-            continue
+            rows = conn.execute(
+                "SELECT name, mtime FROM projects WHERE file_path = ?",
+                (str(path),),
+            ).fetchall()
+            if file_mtime <= current_max:
+                # Check if this specific file is already in the index at this mtime.
+                # If duplicate rows exist for the same file path, parse once and let
+                # _upsert_project collapse the stale display-name rows.
+                current_row = next((row for row in rows if int(row["mtime"]) >= file_mtime), None)
+                if len(rows) == 1 and current_row:
+                    continue
 
-        _upsert_project(conn, data)
-        updated += 1
+            data = parse_memory_file(path)
+            if data is None:
+                continue
 
-    if updated:
-        conn.commit()
+            _upsert_project(conn, data)
+            updated += 1
+
+        if updated:
+            conn.commit()
 
     if projects_root is not None:
         _refresh_git_recency(conn, projects_root)
@@ -417,16 +490,18 @@ def build_full_index(
 
     indexed = 0
     files = sorted(memory_dir.glob("project_*.md"))
-    pruned = _prune_missing_files(conn, {str(path) for path in files})
 
-    for path in files:
-        data = parse_memory_file(path)
-        if data is None:
-            continue
-        _upsert_project(conn, data)
-        indexed += 1
-    if indexed or pruned:
-        conn.commit()
+    with _write_transaction(conn):
+        pruned = _prune_missing_files(conn, {str(path) for path in files})
+
+        for path in files:
+            data = parse_memory_file(path)
+            if data is None:
+                continue
+            _upsert_project(conn, data)
+            indexed += 1
+        if indexed or pruned:
+            conn.commit()
     if projects_root is not None:
         _refresh_git_recency(conn, projects_root)
     return indexed
