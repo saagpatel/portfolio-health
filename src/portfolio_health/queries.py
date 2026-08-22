@@ -408,39 +408,101 @@ _UNSHIPPED_PATTERNS = [
 ]
 
 
+# Memory files declare their checkout as "**Repo**: /path" or "**Repo:** `/path`".
+# Authoritative where present, and the only way to resolve a project whose display
+# name differs from its directory ("Premise Project" living in ~/Projects/Premise).
+_REPO_DECL = re.compile(r"\*\*Repo:?\*\*:?\s*`?\s*(?P<path>[^\s`\n]+)")
+
+
+def _resolve_repo_dir(name: str, body: str, projects_root: Path | None = None) -> Path | None:
+    """Locate a project's checkout: declared path first, then name-based lookup."""
+    from .indexer import _PROJECTS_ROOT, _resolve_project_dir
+
+    root = projects_root or _PROJECTS_ROOT
+
+    match = _REPO_DECL.search(body or "")
+    if match:
+        declared = Path(match.group("path")).expanduser()
+        # Re-root a declared absolute path onto the caller's projects_root so tests
+        # and relocated checkouts resolve without rewriting every memory file.
+        candidates = (declared, root / declared.name)
+        for candidate in candidates:
+            if candidate.is_dir():
+                return candidate
+
+    return _resolve_project_dir(name, root)
+
+
+def _deploy_target(repo_dir: Path | None) -> str | None:
+    """Vercel project linked in *repo_dir*, or None if unlinked or unresolvable.
+
+    Deployment evidence the memory description cannot supply. A ``.vercel/project.json``
+    means someone has already deployed this repo at least once, which is exactly the
+    case a ship-ready description reads identically to. Local file read only: no
+    network, so a linked project may still be a stale or failed deployment.
+    """
+    if repo_dir is None:
+        return None
+    try:
+        data = json.loads((repo_dir / ".vercel" / "project.json").read_text())
+    except (OSError, ValueError):
+        return None
+    target = data.get("projectName") or data.get("projectId")
+    return str(target) if target else None
+
+
 def unshipped(
     index_conn: sqlite3.Connection,
     bridge_path: Path = DEFAULT_BRIDGE_PATH,
+    projects_root: Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Projects that look ship-ready but have no SHIPPED activity in last 30 days."""
+    """Projects whose description claims ship-ready and that carry no recent SHIPPED event.
+
+    This is a *candidate* signal, not deployment status. It rests on two weak inputs:
+    prose in a memory file, which a past session may have written before the deploy and
+    never updated, and the absence of a bridge-db SHIPPED event, which is a record of
+    bookkeeping rather than of reality. Every result therefore carries ``deploy_target``
+    and ``basis`` so a caller cannot read "unshipped" as "not deployed" without also
+    seeing what the claim is made of. Confirm against the live URL before acting.
+    """
     cutoff_30 = _days_ago_iso(30)
     summary = _load_activity_summary(bridge_path)
 
-    recently_shipped = {
-        name for name, s in summary.items() if any(ts >= cutoff_30 for ts in s.shipped_timestamps)
-    }
-    # Last SHIPPED timestamp per project, for days_since_last_shipped.
-    shipped_dates = {
-        name: s.last_shipped_ts for name, s in summary.items() if s.last_shipped_ts is not None
-    }
+    # Multi-key ship lookup, matching stale_candidates: a SHIPPED event logged under a
+    # bridge project_name that differs in case or spacing from the index name would
+    # otherwise never match, and the project would read as unshipped forever.
+    recently_shipped: set[str] = set()
+    shipped_dates: dict[str, str] = {}
+    for bridge_name, s in summary.items():
+        if any(ts >= cutoff_30 for ts in s.shipped_timestamps):
+            recently_shipped.add(bridge_name)
+            recently_shipped.add(bridge_name.lower())
+        if s.last_shipped_ts is not None:
+            shipped_dates.setdefault(bridge_name, s.last_shipped_ts)
+            shipped_dates.setdefault(bridge_name.lower(), s.last_shipped_ts)
 
     now = datetime.now(UTC)
 
-    projects = index_conn.execute("SELECT name, description, file_path FROM projects").fetchall()
+    projects = index_conn.execute(
+        "SELECT name, slug, description, file_path, body FROM projects"
+    ).fetchall()
 
     results = []
     for p in projects:
         name = p["name"]
+        slug = p["slug"] or ""
         desc = p["description"] or ""
 
         # Check if description matches any ship-ready pattern
         if not any(pat.search(desc) for pat in _UNSHIPPED_PATTERNS):
             continue
 
-        if name in recently_shipped:
+        if name in recently_shipped or slug in recently_shipped or name.lower() in recently_shipped:
             continue
 
-        last_shipped_ts = shipped_dates.get(name)
+        last_shipped_ts = (
+            shipped_dates.get(name) or shipped_dates.get(slug) or shipped_dates.get(name.lower())
+        )
         if last_shipped_ts:
             try:
                 ts_str = last_shipped_ts.replace("Z", "+00:00")
@@ -453,13 +515,50 @@ def unshipped(
         else:
             days_since = None
 
+        repo_dir = _resolve_repo_dir(name, p["body"], projects_root)
+        deploy_target = _deploy_target(repo_dir)
+
         results.append(
             {
                 "name": name,
                 "description": desc,
                 "file_path": p["file_path"],
+                "shipped_ever": last_shipped_ts is not None,
+                "last_shipped_ts": last_shipped_ts,
                 "days_since_last_shipped": days_since,
+                "repo_dir": str(repo_dir) if repo_dir else None,
+                "deploy_target": deploy_target,
+                "basis": _unshipped_basis(last_shipped_ts, days_since, repo_dir, deploy_target),
             }
         )
 
     return results
+
+
+def _unshipped_basis(
+    last_shipped_ts: str | None,
+    days_since: int | None,
+    repo_dir: Path | None,
+    deploy_target: str | None,
+) -> str:
+    """One line naming exactly what a result rests on, and what still needs checking."""
+    if last_shipped_ts is None:
+        ship_part = "no SHIPPED event recorded in bridge-db"
+    elif days_since is None:
+        ship_part = f"last SHIPPED event {last_shipped_ts} (unparseable timestamp)"
+    else:
+        ship_part = f"last SHIPPED event was {days_since}d ago"
+
+    # Three distinct outcomes, never collapsed into one phrase: an unlocatable repo
+    # is not evidence of anything, and must not read as evidence of no deployment.
+    if deploy_target:
+        deploy_part = (
+            f"repo is linked to deploy target '{deploy_target}', "
+            "so it may already be live: verify the URL before treating this as unshipped"
+        )
+    elif repo_dir is None:
+        deploy_part = "repo working tree could not be located, so deployment state is unknown"
+    else:
+        deploy_part = "no deploy link found in the repo working tree"
+
+    return f"description claims ship-ready; {ship_part}; {deploy_part}"

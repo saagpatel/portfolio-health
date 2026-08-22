@@ -94,11 +94,18 @@ def portfolio_stale_candidates(days: int = 90) -> list[dict]:
 
 @mcp.tool()
 def portfolio_unshipped() -> list[dict]:
-    """Return projects that look ship-ready but have no SHIPPED activity tag in 30 days.
+    """Return ship-ready-looking projects carrying no SHIPPED activity tag in 30 days.
 
-    Detects: 'v1.0 complete/done/ready', 'deploy-ready', 'launch-ready',
-    'all phases done/complete' in the project description.
-    Each item: {name, description, file_path, days_since_last_shipped}.
+    NOT deployment status. A result means the memory description claims ship-ready
+    ('v1.0 complete/done/ready', 'deploy-ready', 'launch-ready', 'all phases
+    done/complete') and bookkeeping shows no recent SHIPPED event. Both inputs are
+    prose and records, not reality: a project already live for months reads identically
+    to one never deployed, if nobody logged the event or refreshed the description.
+
+    Each item: {name, description, file_path, shipped_ever, last_shipped_ts,
+    days_since_last_shipped, repo_dir, deploy_target, basis}. Read 'deploy_target' and 'basis'
+    before acting: a non-null deploy_target means the repo is linked to a deployment
+    and is probably already live. Confirm against the live URL either way.
     """
     conn = _get_conn()
     return unshipped(conn, bridge_path=_bridge_path)

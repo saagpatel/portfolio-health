@@ -619,14 +619,22 @@ def test_unshipped_includes_v1_done(index_conn, bridge_db):
     assert "Delta Engine" in names
 
 
-def test_unshipped_fields(index_conn, bridge_db):
-    results = unshipped(index_conn, bridge_path=bridge_db)
+def test_unshipped_fields(index_conn, bridge_db, tmp_path):
+    results = unshipped(index_conn, bridge_path=bridge_db, projects_root=tmp_path / "empty")
     assert len(results) > 0
     r = results[0]
-    assert "name" in r
-    assert "description" in r
-    assert "file_path" in r
-    assert "days_since_last_shipped" in r
+    for field in (
+        "name",
+        "description",
+        "file_path",
+        "shipped_ever",
+        "last_shipped_ts",
+        "days_since_last_shipped",
+        "repo_dir",
+        "deploy_target",
+        "basis",
+    ):
+        assert field in r
 
 
 def test_unshipped_excludes_no_pattern(index_conn, bridge_db):
@@ -661,6 +669,150 @@ def test_unshipped_no_bridge(index_conn, tmp_path):
     names = [r["name"] for r in results]
     # Alpha, Beta, Delta, Eta, Theta all have ship-ready descriptions
     assert len(names) >= 1
+
+
+# ---------------------------------------------------------------------------
+# portfolio_unshipped — deployment evidence
+#
+# The signal reads two weak inputs (memory prose + bookkeeping) and was being
+# consumed as deployment status. These cover the gap: a project already live
+# looks identical to one never deployed unless the repo's deploy link is read.
+# ---------------------------------------------------------------------------
+
+
+def _link_deploy_target(projects_root: Path, project_name: str, target: str | None) -> None:
+    """Write a .vercel/project.json under a fake ~/Projects dir for *project_name*."""
+    link_dir = projects_root / project_name / ".vercel"
+    link_dir.mkdir(parents=True)
+    body = "{ this is not json" if target is None else f'{{"projectName": "{target}"}}'
+    (link_dir / "project.json").write_text(body)
+
+
+def test_unshipped_reports_deploy_target_when_repo_is_linked(index_conn, bridge_db, tmp_path):
+    """A linked repo is probably already live — the exact case that misled a caller."""
+    projects_root = tmp_path / "Projects"
+    _link_deploy_target(projects_root, "Beta Dashboard", "beta-dash")
+
+    results = unshipped(index_conn, bridge_path=bridge_db, projects_root=projects_root)
+    beta = next(r for r in results if r["name"] == "Beta Dashboard")
+
+    assert beta["deploy_target"] == "beta-dash"
+    assert "beta-dash" in beta["basis"]
+    assert "verify" in beta["basis"].lower()
+
+
+def test_unshipped_deploy_target_none_when_repo_is_unlinked(index_conn, bridge_db, tmp_path):
+    projects_root = tmp_path / "Projects"
+    (projects_root / "Beta Dashboard").mkdir(parents=True)
+
+    results = unshipped(index_conn, bridge_path=bridge_db, projects_root=projects_root)
+    beta = next(r for r in results if r["name"] == "Beta Dashboard")
+
+    assert beta["deploy_target"] is None
+    assert "no deploy link" in beta["basis"]
+
+
+def test_unshipped_distinguishes_missing_repo_from_unlinked_repo(index_conn, bridge_db, tmp_path):
+    """An unlocatable checkout is not evidence of no deployment, and must not read as it."""
+    empty_root = tmp_path / "Projects"
+    empty_root.mkdir()
+
+    results = unshipped(index_conn, bridge_path=bridge_db, projects_root=empty_root)
+    beta = next(r for r in results if r["name"] == "Beta Dashboard")
+
+    assert beta["repo_dir"] is None
+    assert beta["deploy_target"] is None
+    assert "could not be located" in beta["basis"]
+    assert "no deploy link" not in beta["basis"]
+
+
+def test_unshipped_survives_malformed_deploy_link(index_conn, bridge_db, tmp_path):
+    projects_root = tmp_path / "Projects"
+    _link_deploy_target(projects_root, "Beta Dashboard", None)
+
+    results = unshipped(index_conn, bridge_path=bridge_db, projects_root=projects_root)
+    beta = next(r for r in results if r["name"] == "Beta Dashboard")
+
+    assert beta["deploy_target"] is None
+
+
+def test_unshipped_uses_declared_repo_path_when_name_differs_from_directory(tmp_path, bridge_db):
+    """Display name "Kappa Project" lives in ~/Projects/Kappa — name lookup alone misses it.
+
+    Without reading the declared **Repo** path, a linked repo reports no deploy link,
+    which is the misleading direction: it understates that the project may be live.
+    """
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    (memory / "project_kappa.md").write_text(
+        "---\n"
+        "name: Kappa Project\n"
+        "description: Static explainer site, deploy-ready\n"
+        "type: project\n"
+        "status: active\n"
+        "---\n\n"
+        "**Repo:** `/Users/nonexistent/Projects/Kappa`\n"
+    )
+
+    projects_root = tmp_path / "Projects"
+    _link_deploy_target(projects_root, "Kappa", "kappa-site")
+
+    conn = open_index(tmp_path / "kappa-index.db")
+    build_full_index(conn, memory)
+
+    results = unshipped(conn, bridge_path=bridge_db, projects_root=projects_root)
+    kappa = next(r for r in results if r["name"] == "Kappa Project")
+
+    assert kappa["deploy_target"] == "kappa-site"
+
+
+def test_unshipped_matches_shipped_event_logged_under_different_case(index_conn, bridge_db):
+    """A SHIPPED event logged as 'beta dashboard' must still clear 'Beta Dashboard'.
+
+    Exact-name matching made a correctly-logged ship invisible, so the project read
+    as unshipped permanently.
+    """
+    conn = sqlite3.connect(str(bridge_db))
+    recent = (datetime.now(UTC) - timedelta(days=3)).strftime("%Y-%m-%d")
+    conn.execute(
+        "INSERT INTO activity_log (source, timestamp, project_name, summary, tags)"
+        " VALUES (?, ?, ?, ?, ?)",
+        ("cc", recent, "beta dashboard", "Deployed to production", '["SHIPPED"]'),
+    )
+    conn.commit()
+    conn.close()
+
+    results = unshipped(index_conn, bridge_path=bridge_db)
+
+    assert "Beta Dashboard" not in [r["name"] for r in results]
+
+
+def test_unshipped_marks_long_ago_ship_rather_than_claiming_never_shipped(index_conn, bridge_db):
+    """Shipped outside the 30-day window still lists, but must not read as never-shipped."""
+    conn = sqlite3.connect(str(bridge_db))
+    long_ago = (datetime.now(UTC) - timedelta(days=200)).strftime("%Y-%m-%d")
+    conn.execute(
+        "INSERT INTO activity_log (source, timestamp, project_name, summary, tags)"
+        " VALUES (?, ?, ?, ?, ?)",
+        ("cc", long_ago, "Delta Engine", "Shipped v1.0", '["SHIPPED"]'),
+    )
+    conn.commit()
+    conn.close()
+
+    results = unshipped(index_conn, bridge_path=bridge_db)
+    delta = next(r for r in results if r["name"] == "Delta Engine")
+
+    assert delta["shipped_ever"] is True
+    assert delta["days_since_last_shipped"] >= 199
+    assert "no SHIPPED event recorded" not in delta["basis"]
+
+
+def test_unshipped_basis_states_missing_ship_record(index_conn, bridge_db, tmp_path):
+    results = unshipped(index_conn, bridge_path=bridge_db, projects_root=tmp_path / "empty")
+    beta = next(r for r in results if r["name"] == "Beta Dashboard")
+
+    assert beta["shipped_ever"] is False
+    assert "no SHIPPED event recorded in bridge-db" in beta["basis"]
 
 
 # ---------------------------------------------------------------------------
